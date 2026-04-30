@@ -1193,9 +1193,12 @@ public:
         dilation_y = std::ceil(dilation_y);
         dilation_z = std::ceil(dilation_z);
 
-        size_x_out -= dilation_x;
-        size_y_out -= dilation_y;
-        size_z_out -= dilation_z;
+        auto sub_clamp = [](size_t a, double b) -> size_t {
+            return (size_t)std::max<int64_t>((int64_t)a - (int64_t)b, 1);
+        };
+        size_x_out = sub_clamp(size_x_out, dilation_x);
+        size_y_out = sub_clamp(size_y_out, dilation_y);
+        size_z_out = sub_clamp(size_z_out, dilation_z);
 
         size_x_out = std::max(size_x_out, (size_t)1);
         size_y_out = std::max(size_y_out, (size_t)1);
@@ -1306,10 +1309,10 @@ public:
             std::map<std::tuple<size_t, size_t, size_t, size_t, size_t>, uint16_t *> chunk_cache;
             std::set<std::tuple<size_t, size_t, size_t, size_t, size_t>> back_mchunks;
 
-            // Scaled metachunk size
-            const size_t mcx = mchunkx / scale;
-            const size_t mcy = mchunky / scale;
-            const size_t mcz = mchunkz / scale;
+            // Scaled metachunk size — clamp to >=1
+            const size_t mcx = std::max<size_t>(1, mchunkx / scale);
+            const size_t mcy = std::max<size_t>(1, mchunky / scale);
+            const size_t mcz = std::max<size_t>(1, mchunkz / scale);
 
             // Variables to store chunk reader and data (shared in loop)
             packed_reader *chunk_reader = nullptr;
@@ -1641,10 +1644,11 @@ public:
         std::map<std::tuple<size_t, size_t, size_t, size_t, size_t>, uint16_t *> chunk_cache;
         std::map<uint16_t *, std::tuple<size_t, size_t, size_t>> chunk_sizes;
 
-        // Scaled metachunk size
-        const size_t mcx = mchunkx / scale;
-        const size_t mcy = mchunky / scale;
-        const size_t mcz = mchunkz / scale;
+        // Scaled metachunk size — clamp to >=1 so a thin axis (e.g.
+        // z=1 with no Z pyramid) doesn't divide by zero further down.
+        const size_t mcx = std::max<size_t>(1, mchunkx / scale);
+        const size_t mcy = std::max<size_t>(1, mchunky / scale);
+        const size_t mcz = std::max<size_t>(1, mchunkz / scale);
 
         // Variables to store chunk reader and data (shared in loop)
         packed_reader *chunk_reader = nullptr;
