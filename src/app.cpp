@@ -48,7 +48,7 @@ bool READ_ONLY_MODE = false;
 std::string DATA_PATH = "./data/";
 std::string SERVER_ROOT = "https://server/";
 
-const std::string VERSION_STRING = "V0.13.1";
+const std::string VERSION_STRING = "V0.13.1-cai1";
 
 using json = nlohmann::json;
 
