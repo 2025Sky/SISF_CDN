@@ -61,6 +61,10 @@ class Server:
                 path = os.path.join(dirpath, f)
                 self.fixture_hashes[os.path.relpath(path, self.data_dir)] = file_sha(path)
 
+    def exec(self, *args):
+        """Runs a command inside the container, which sees the data at /data."""
+        subprocess.run(["docker", "exec", self.name, *args], check=True, capture_output=True)
+
     def start(self):
         cmd = ["docker", "run", "-d", "--name", self.name, "-p", "127.0.0.1::6000",
                "-v", f"{self.data_dir}:/data"]
@@ -298,6 +302,7 @@ def sc_stale_geometry(server, results, sid):
     root = os.path.join(server.data_dir, ds)
     fixtures.tiled(root, 1, (3, 2, 1), tile, (24, 24, 0), RES, 3)  # step 72
     time.sleep(1.2)  # the CDN compares .meta mtimes in whole seconds
+    results[f"{sid}: /info before"] = digest(*server.request("GET", f"/{ds}/info"))
     results[f"{sid}: read before"] = digest(*server.request("GET", f"/{ds}/1/" + box(0, 216, 0, 144, 0, 1)))
     fixtures.tiled(root, 1, (3, 2, 1), tile, (32, 32, 0), RES, 3)  # in place, step 64
     time.sleep(1.2)
@@ -316,6 +321,11 @@ def sc_stale_geometry(server, results, sid):
             f.write(struct.pack(fixtures.SHARD_HEADER_LAYOUT, *v))
     time.sleep(1.2)
     results[f"{sid}: read aligned tile"] = digest(*server.request("GET", f"/{ds}/1/" + box(72, 144, 0, 72, 0, 1)))
+    # The archive geometry (tile step, size) is read once per process. A
+    # server that died above comes back with the new one; one that stayed up
+    # keeps the old one until it is restarted.
+    results[f"{sid}: /info after the event"] = digest(*server.request("GET", f"/{ds}/info"))
+    results[f"{sid}: full read after the event"] = digest(*server.request("GET", f"/{ds}/1/" + box(0, 192, 0, 128, 0, 1)))
 
 
 def _vol(root):
@@ -385,16 +395,129 @@ def sc_unreadable_chunk_write(server, results, sid):
     results[f"{sid}: read the chunk back"] = digest(*server.request("GET", f"/{ds}/1/" + box(32, 64, 32, 64, 0, 32)))
 
 
+def seg_labels_zyx(size, mchunk, seed):
+    """The labels fixtures.segmentation(prefill_seed=seed) writes, as a full
+    volume in the order the CDN returns it (z, y, x)."""
+    vol = np.zeros(size, dtype=np.uint16)
+    for i, (i0, i1) in enumerate(fixtures.iterate_bounded(size[0], mchunk[0])):
+        for j, (j0, j1) in enumerate(fixtures.iterate_bounded(size[1], mchunk[1])):
+            for k, (k0, k1) in enumerate(fixtures.iterate_bounded(size[2], mchunk[2])):
+                shape = (i1 - i0, j1 - j0, k1 - k0)
+                vol[i0:i1, j0:j1, k0:k1] = fixtures.pattern(shape, seed + i * 9 + j * 5 + k) % 7
+    return vol.transpose(2, 1, 0)
+
+
+def sc_read_failure_before_patch(server, results, sid):
+    """The portal's read-merge-PATCH over a prefilled writable layer, with
+    mchunk (0,0,0)'s .data unreadable for the read only (renamed inside the
+    container and back). Production answers that read with zeros for the
+    mchunk, and the PATCH writes them over its labels, 200 both times. The
+    portal's read carries its token; a viewer's does not."""
+    ds, size, mchunk, seed = "sc_strict", (96, 64, 32), (64, 64, 32), 7
+    root = os.path.join(server.data_dir, ds)
+    fixtures.segmentation(root, size, mchunk, RES, prefill_seed=seed)
+    server.snapshot(ds)
+    b, shape = box(0, 96, 0, 64, 0, 32), (32, 64, 96)  # the portal's clamped super-chunk
+    data = f"/data/{ds}/data/chunk_0_0_0.0.1X.data"
+    server.exec("mv", data, data + ".away")
+    results[f"{sid}: viewer read (no token)"] = digest(*server.request("GET", f"/{ds}/1/{b}"))
+    st, cur = server.request("GET", f"/{ds}+token={fixtures.TOKEN}/1/{b}")
+    results[f"{sid}: portal read before the PATCH"] = digest(st, cur)
+    server.exec("mv", data + ".away", data)
+    if st == 200:
+        # The portal only goes on after a 200. A stroke in mchunk (1,0,0),
+        # painted where nothing is stored yet (protect_existing).
+        vol = np.frombuffer(cur, dtype=np.uint16).reshape(shape).copy()
+        stroke = vol[0:10, 20:30, 70:80]
+        stroke[stroke == 0] = 9
+        results[f"{sid}: PATCH"] = digest(*server.request(
+            "PATCH", f"/{ds}+token={fixtures.TOKEN}/write/1/{b}", vol.tobytes()))
+    else:
+        results[f"{sid}: PATCH"] = {"status": "not sent", "len": None, "sha256": None, "text": "the read failed"}
+    st, after = server.request("GET", f"/{ds}/1/{b}")
+    results[f"{sid}: read back"] = digest(st, after)
+    if st == 200:
+        truth = seg_labels_zyx(size, mchunk, seed)
+        got = np.frombuffer(after, dtype=np.uint16).reshape(shape)
+        lost = int(((truth != 0) & (got != truth)).sum())
+        results[f"{sid}: stored labels lost"] = {"status": "count", "len": None, "sha256": None, "text": str(lost)}
+
+
+def _set_crop_start(meta, x0, y0, width=72):
+    """An alignment: move a tile's crop window, keeping its width."""
+    with open(meta, "r+b") as f:
+        v = list(struct.unpack(fixtures.SHARD_HEADER_LAYOUT, f.read(86)))
+        v[10], v[11], v[12], v[13] = x0, x0 + width, y0, y0 + width
+        f.seek(0)
+        f.write(struct.pack(fixtures.SHARD_HEADER_LAYOUT, *v))
+
+
+def _tiled_skeleton(root, tile, crop_start):
+    """A writable 3x2 tiled layer with nothing written yet, tile step 72,
+    1X only."""
+    fixtures.write_metadata(root, 1, (72, 72, 1), RES, (216, 144, 1))
+    for tx in range(3):
+        for ty in range(2):
+            name = f"chunk_{tx}_{ty}_0.0.1X"
+            fixtures.write_skeleton(f"{root}/data/{name}.data", f"{root}/meta/{name}.meta", tile, (32, 32, 1))
+            _set_crop_start(f"{root}/meta/{name}.meta", *crop_start)
+    with open(f"{root}/.sisf_access", "w") as f:
+        f.write(fixtures.TOKEN + "\n")
+
+
+def sc_regrown_tile(server, results, sid):
+    """A tiled dataset re-converted in place with a wider tile (88 -> 96 px,
+    so the last chunk in x grows from 24 to 32 px) while the server holds
+    readers for the old tiles, then tile (1,0,0)'s crop start moved from 12
+    to 24. The box read and written below stays in one chunk under the new
+    geometry, so a reader that reloads inside that chunk's first load keeps
+    the old, smaller chunk extent for the rest of the request. Production
+    dies on the read (the new frame does not fit the old buffer)."""
+    ds, dsw = "sc_regrow", "sc_regrow_w"
+    root, rootw = os.path.join(server.data_dir, ds), os.path.join(server.data_dir, dsw)
+    old_tile, new_tile = (88, 96, 1), (96, 96, 1)
+    fixtures.tiled(root, 1, (3, 2, 1), old_tile, (16, 24, 0), RES, 5)  # step 72, crop start (8, 12)
+    _set_crop_start(os.path.join(root, "meta", "chunk_1_0_0.0.1X.meta"), 12, 12)
+    _tiled_skeleton(rootw, old_tile, (8, 12))
+    _set_crop_start(os.path.join(rootw, "meta", "chunk_1_0_0.0.1X.meta"), 12, 12)
+    time.sleep(1.2)
+    results[f"{sid}: read before"] = digest(*server.request("GET", f"/{ds}/1/" + box(0, 216, 0, 144, 0, 1)))
+    results[f"{sid}: writable copy: read before"] = digest(*server.request(
+        "GET", f"/{dsw}/1/" + box(0, 216, 0, 144, 0, 1)))
+    fixtures.tiled(root, 1, (3, 2, 1), new_tile, (24, 24, 0), RES, 5)  # in place, step 72, crop start (12, 12)
+    _set_crop_start(os.path.join(root, "meta", "chunk_1_0_0.0.1X.meta"), 24, 24)
+    _tiled_skeleton(rootw, new_tile, (12, 12))
+    _set_crop_start(os.path.join(rootw, "meta", "chunk_1_0_0.0.1X.meta"), 24, 24)
+    time.sleep(1.2)
+    b = box(124, 144, 0, 8, 0, 1)
+    results[f"{sid}: read across the regrown chunk"] = digest(*server.request("GET", f"/{ds}/1/{b}"))
+    results[f"{sid}: same read again"] = digest(*server.request("GET", f"/{ds}/1/{b}"))
+    results[f"{sid}: PATCH the writable copy"] = digest(*server.request(
+        "PATCH", f"/{dsw}+token={fixtures.TOKEN}/write/1/{b}", np.full(20 * 8, 3, dtype=np.uint16).tobytes()))
+    results[f"{sid}: writable copy: read the box back"] = digest(*server.request("GET", f"/{dsw}/1/{b}"))
+
+
+def sc_raw_access_outside(server, results, sid):
+    """raw_access over a range wider than the mchunk's stored tile (vol1c's
+    mchunk (0,0,0) is 64 px wide). Production reads past the chunk buffer."""
+    results[f"{sid}: read"] = digest(*server.request("GET", "/vol1c/raw_access/0,0,0,0/1/" + box(0, 100, 0, 10, 0, 1)))
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
+# s7 runs last: production dies in it, and nothing should depend on a server
+# that has just been through it.
 SCENARIOS = [
     ("s1 stale geometry", sc_stale_geometry),
     ("s2 corrupt zstd frame", sc_corrupt_zstd),
     ("s3 bad compression type", sc_bad_compression),
     ("s4 missing .data", sc_missing_data),
     ("s5 unreadable chunk under a PATCH", sc_unreadable_chunk_write),
+    ("s6 read failure before a PATCH", sc_read_failure_before_patch),
+    ("s8 raw_access outside the mchunk", sc_raw_access_outside),
+    ("s7 tile regrown in place", sc_regrown_tile),
 ]
-SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short"]
+SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short", "sc_strict", "sc_regrow", "sc_regrow_w"]
 
 
 def run_scenarios(server, results):

@@ -18,15 +18,26 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
 - A server that dies is recorded as CRASH and restarted. Two crashes on the
   same request count as the same behaviour; every crash is listed either way.
   A server that stays up but does not answer in time is recorded as TIMEOUT.
-- After the write and danger stages, `scenarios` runs the cases that kill or
-  hang production, each on a dataset it builds while the server runs, with a
-  liveness check after each: stale archive geometry after an in-place
-  re-conversion (the 2026-08-30 abort), a corrupt zstd frame, an unknown
-  compression type in an mchunk header, a writable layer with a missing
-  `.data` file (production leaks its write lock; that case uses a 20 s client
-  timeout and restarts a server that timed out), and a PATCH over a chunk
-  whose data is cut short (production overwrites the chunk's other voxels
-  with zeros and answers 200).
+- After the write and danger stages, `scenarios` runs the cases that kill,
+  hang or lose data on production, each on a dataset it builds while the
+  server runs, with a liveness check after each:
+  - s1: stale archive geometry after an in-place re-conversion (the
+    2026-08-30 abort), then `/info` and a full read of the same dataset
+    afterwards;
+  - s2: a corrupt zstd frame; s3: an unknown compression type in an mchunk
+    header;
+  - s4: a writable layer with a missing `.data` file (production leaks its
+    write lock; this case uses a 20 s client timeout and restarts a server
+    that timed out);
+  - s5: a PATCH over a chunk whose data is cut short (production overwrites
+    the chunk's other voxels with zeros and answers 200);
+  - s6: the portal's read-merge-PATCH with one mchunk's `.data` unreadable
+    during the read only (renamed inside the container with `docker exec`
+    and back), plus a viewer's read of the same failure;
+  - s7: a tile re-converted in place with a wider tile while the server
+    holds readers for it, then read and written in the one chunk whose
+    extent grew; it runs last because production dies in it;
+  - s8: a `raw_access` read wider than the mchunk's stored tile.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` for a response, `sha256` for a file, or
