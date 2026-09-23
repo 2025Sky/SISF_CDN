@@ -36,9 +36,9 @@ jobs:
         with:
           submodules: 'true'
 
-      - name: Record the build CPU (the Makefile compiles with -march=native)
+      - name: Record the build CPU (the server is compiled for x86-64-v3, not for this CPU)
         run: |
-          lscpu | grep -E 'Model name|Flags' | cut -c1-400
+          lscpu | grep -E 'Model name' | cut -c1-200
           gcc -march=native -Q --help=target | grep -E '^\s+-march='
 
       - uses: docker/setup-buildx-action@v3
