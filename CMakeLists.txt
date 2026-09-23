@@ -48,6 +48,12 @@ else()
   set(NTRACER_MARCH "native" CACHE STRING "Target CPU for nTracer_cdn")
 endif()
 target_compile_options(nTracer_cdn PUBLIC -O3 -march=${NTRACER_MARCH} -Wl,--no-as-needed -ldl)
+# half.hpp (a tensorstore dependency) tests HALF_ENABLE_F16C_INTRINSICS before
+# it defines it, so with __F16C__ set (x86-64-v3) it uses F16C intrinsics
+# without including <immintrin.h> and app.cpp fails to compile. Tensorstore's
+# own objects are built without -march and use the portable path, so keep the
+# server's inline copies on the same path.
+target_compile_definitions(nTracer_cdn PRIVATE HALF_ENABLE_F16C_INTRINSICS=0)
 
 
 FetchContent_Declare(
