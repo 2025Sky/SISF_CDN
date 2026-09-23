@@ -1989,6 +1989,8 @@ public:
 
         // Define map for storing already decompressed chunks
         std::map<std::tuple<size_t, size_t, size_t, size_t, size_t>, region_chunk> chunk_cache;
+        // Readers whose .meta mtime this request has checked
+        std::set<packed_reader *> checked_readers;
 
         // Scaled metachunk size — clamp to >=1 so a thin axis (e.g.
         // z=1 with no Z pyramid) doesn't divide by zero further down.
@@ -2071,6 +2073,14 @@ public:
                                 return reject("Missing mchunk", "mchunk " + std::to_string(chunk_id_x) + '_' + std::to_string(chunk_id_y) + '_' + std::to_string(chunk_id_z) + " channel " + std::to_string(c));
                             }
 
+                            // Pick up a header rewritten on disk before any offset is computed from
+                            // it, once per mchunk per request. A chunk this request covers entirely is
+                            // never loaded, so the reload inside load_chunk would not run for it.
+                            if (checked_readers.insert(chunk_reader).second)
+                            {
+                                chunk_reader->reload_if_modified();
+                            }
+
                             last_x = chunk_id_x;
                             last_y = chunk_id_y;
                             last_z = chunk_id_z;
@@ -2133,14 +2143,36 @@ public:
                             }
                             if (cached.ptr == nullptr)
                             {
-                                // Writing back a chunk that failed to load would replace its
-                                // voxels outside this region with zeros
-                                bool load_failed = false;
-                                chunk = chunk_reader->load_chunk(sub_chunk_id, cxsize, cysize, czsize, &load_failed);
-                                if (chunk == nullptr || load_failed)
+                                // Where the request lies inside this mchunk's stored tile
+                                const size_t rx0 = std::max(xs, xmin) - xmin + chunk_reader->cropstartx;
+                                const size_t rx1 = std::min(xe, xmin + mcx) - xmin + chunk_reader->cropstartx;
+                                const size_t ry0 = std::max(ys, ymin) - ymin + chunk_reader->cropstarty;
+                                const size_t ry1 = std::min(ye, ymin + mcy) - ymin + chunk_reader->cropstarty;
+                                const size_t rz0 = std::max(zs, zmin) - zmin + chunk_reader->cropstartz;
+                                const size_t rz1 = std::min(ze, zmin + mcz) - zmin + chunk_reader->cropstartz;
+
+                                if (rx0 <= cxmin && rx1 >= cxmax && ry0 <= cymin && ry1 >= cymax && rz0 <= czmin && rz1 >= czmax)
                                 {
-                                    free(chunk);
-                                    return reject("Could not read existing chunk", chunk_reader->data_fname + " chunk " + std::to_string(sub_chunk_id));
+                                    // Every voxel of the chunk is overwritten, so what is stored
+                                    // does not matter, and a chunk that cannot be read can be
+                                    // replaced
+                                    chunk = (uint16_t *)calloc(cxsize * cysize * czsize, sizeof(uint16_t));
+                                    if (chunk == nullptr)
+                                    {
+                                        return reject("Out of memory", chunk_reader->data_fname + " chunk " + std::to_string(sub_chunk_id));
+                                    }
+                                }
+                                else
+                                {
+                                    // Writing back a chunk that failed to load would replace its
+                                    // voxels outside this region with zeros
+                                    bool load_failed = false;
+                                    chunk = chunk_reader->load_chunk(sub_chunk_id, cxsize, cysize, czsize, &load_failed);
+                                    if (chunk == nullptr || load_failed)
+                                    {
+                                        free(chunk);
+                                        return reject("Could not read existing chunk", chunk_reader->data_fname + " chunk " + std::to_string(sub_chunk_id));
+                                    }
                                 }
                                 cached = region_chunk{chunk, cxmin, cymin, czmin, cxsize, cysize, czsize};
                             }
