@@ -2286,13 +2286,32 @@ int main(int argc, char *argv[])
 			}
 		}
 
+		// +channel=N returns channel N only; without it, every channel
+		int64_t channel = -1;
+		for (const auto &pair : filters)
+		{
+			if (pair.first == "channel")
+			{
+				size_t n = 0;
+				if (!parse_decimal(pair.second, n) || n >= reader->channel_count)
+				{
+					res.code = crow::status::BAD_REQUEST;
+					res.end("400 Bad Request -- Invalid channel: this dataset has channels 0 to " +
+							std::to_string(reader->channel_count - 1) + "\n");
+					return;
+				}
+				channel = (int64_t)n;
+			}
+		}
+		const size_t channels_out = channel < 0 ? reader->channel_count : 1;
+
 		// Create the output buffer
 		// The subvolume data for the chunk is stored directly in little-endian binary format in [x, y, z, channel]
 		// Fortran order (i.e. consecutive x values are contiguous)
 		//                          Z              Y              X             CH
 		//uint16_t out_buffer[chunk_sizes[2]][chunk_sizes[1]][chunk_sizes[0]][channel_count];
 		//uint16_t out_buffer[handler->channel_count][chunk_sizes[2]][chunk_sizes[1]][chunk_sizes[0]];
-		const size_t out_buffer_size = sizeof(uint16_t) * chunk_sizes[0] * chunk_sizes[1] * chunk_sizes[2] * reader->channel_count;
+		const size_t out_buffer_size = sizeof(uint16_t) * chunk_sizes[0] * chunk_sizes[1] * chunk_sizes[2] * channels_out;
 
 		enum projectfunction
 		{
@@ -2437,7 +2456,8 @@ int main(int argc, char *argv[])
 				x_begin_project, x_end_project,
 				y_begin_project, y_end_project,
 				z_begin_project, z_end_project,
-				strict_read ? &read_failed : nullptr
+				strict_read ? &read_failed : nullptr,
+				channel
 			);
 			if (tmp_buffer == NULL)
 			{
@@ -2449,7 +2469,7 @@ int main(int argc, char *argv[])
 
 			uint16_t vout;
 			double sum;
-			for (size_t c = 0; c < reader->channel_count; c++)
+			for (size_t c = 0; c < channels_out; c++)
 			{
 				for (size_t k = 0; k < chunk_sizes[2]; k++)
 				{
@@ -2537,7 +2557,8 @@ int main(int argc, char *argv[])
 				x_begin, x_end,
 				y_begin, y_end,
 				z_begin, z_end,
-				strict_read ? &read_failed : nullptr
+				strict_read ? &read_failed : nullptr,
+				channel
 			);
 		}
 
@@ -2554,7 +2575,7 @@ int main(int argc, char *argv[])
 				out_buffer,
 				out_buffer_size,
 				{chunk_sizes[0], chunk_sizes[1], chunk_sizes[2]},
-				reader->channel_count,
+				channels_out,
 				pair.first,
 				pair.second
 			);

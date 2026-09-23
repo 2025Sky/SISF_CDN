@@ -85,6 +85,10 @@ There is a special command, `project`, which can be used to perform a axis-align
 | `project_axis` | Chooses the direction the projection should be performed (`x`, `y`, `z`, defaults to `z`) |
 | `project_function` | Chooses what mathematical function to perform a projection with (`max`, `min`, `avg`, default `max`) |
 
+### Channel Selection
+
+By default a read returns every channel of the dataset, one after another. `channel=<n>` returns channel `n` only (counting from 0), and can be combined with the other commands, e.g. `image+channel=1&project=8`. A channel the dataset does not have, or a parameter that is not a whole number, answers `400`. The `info` file is unchanged.
+
 ## Local Setup
 
 ### Platform

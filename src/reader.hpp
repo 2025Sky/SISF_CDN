@@ -2341,20 +2341,30 @@ public:
     // mchunk header is unusable, no reader can be built for its mchunk) sets
     // *failed; its voxels read as 0 either way. A chunk never written is not
     // a failure.
+    //
+    // channel < 0 returns every channel; otherwise only that channel, which
+    // the caller has checked is below channel_count.
     uint16_t *load_region(
         size_t scale,
         size_t xs, size_t xe,
         size_t ys, size_t ye,
         size_t zs, size_t ze,
-        bool *failed = nullptr)
+        bool *failed = nullptr,
+        int64_t channel = -1)
     {
         std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+
+        const size_t c0 = channel < 0 ? 0 : (size_t)channel;
+        const size_t c1 = channel < 0 ? channel_count : (size_t)channel + 1;
+        // SISF reads only the channels asked for. The other types read every
+        // channel, and the one asked for is moved to the front at the end.
+        const size_t buffer_channels = type == SISF ? c1 - c0 : channel_count;
 
         // Calculate size of output
         const size_t osizex = xe - xs;
         const size_t osizey = ye - ys;
         const size_t osizez = ze - zs;
-        const size_t buffer_size = osizex * osizey * osizez * sizeof(uint16_t) * channel_count;
+        const size_t buffer_size = osizex * osizey * osizez * sizeof(uint16_t) * buffer_channels;
 
         // Allocate buffer for output
         uint16_t *out_buffer = (uint16_t *)calloc(buffer_size, 1);
@@ -2378,9 +2388,6 @@ public:
                 const size_t mcx = std::max<size_t>(1, mchunkx / scale);
                 const size_t mcy = std::max<size_t>(1, mchunky / scale);
                 const size_t mcz = std::max<size_t>(1, mchunkz / scale);
-
-                const size_t c0 = 0;
-                const size_t c1 = channel_count;
 
                 // Every mchunk the box touches, looked up once each and in the
                 // order the voxel loop first meets them
@@ -2630,6 +2637,12 @@ public:
 
                 free(region);
             }
+        }
+
+        if (type != SISF && c0 > 0)
+        {
+            const size_t channel_voxels = osizex * osizey * osizez;
+            memmove(out_buffer, out_buffer + (c0 * channel_voxels), (c1 - c0) * channel_voxels * sizeof(uint16_t));
         }
 
         if (CHUNK_TIMER)

@@ -642,6 +642,48 @@ def sc_zero_mchunk_size(server, results, sid):
     _unloadable_dataset(server, results, sid, "sc_meta_zero", _zero_mchunk_x)
 
 
+def _slice_check(full, part, n, channels):
+    """Whether part is channel n of full, a read of every channel (each
+    channel is one contiguous block, in channel order)."""
+    size = len(full) // channels
+    ok = len(full) % channels == 0 and part == full[n * size:(n + 1) * size]
+    return {"status": "match" if ok else "mismatch", "len": None, "sha256": None,
+            "text": f"{len(part)} of {len(full)} bytes"}
+
+
+def sc_channel_filter(server, results, sid):
+    """+channel=N returns channel N only. Each such read must equal channel
+    N of the same read without the filter (a box, a plane, a neuroglancer
+    chunk, a coarser level, a projection and a gaussian filter, which works
+    per channel); a channel the dataset does not have, or one that is not a
+    whole number, answers 400. Production ignores the filter and returns
+    every channel."""
+    cases = [
+        ("box", "", 1, box(0, 70, 0, 60, 0, 20)),
+        ("plane", "", 1, box(3, 67, 5, 55, 10, 11)),
+        ("ng chunk", "", 1, box(32, 64, 32, 60, 0, 20)),
+        ("level 2", "", 2, box(0, 35, 0, 30, 0, 10)),
+        ("max projection", "project=6", 1, box(0, 70, 0, 60, 4, 5)),
+        ("gaussian", "gaussian=1", 1, box(10, 30, 10, 30, 5, 10)),
+    ]
+    for tag, extra, scale, b in cases:
+        st, full = server.request("GET", f"/vol3c{'+' + extra if extra else ''}/{scale}/{b}")
+        results[f"{sid}: {tag}, every channel"] = digest(st, full)
+        for n in range(3):
+            filt = f"channel={n}" + (f"&{extra}" if extra else "")
+            st_n, part = server.request("GET", f"/vol3c+{filt}/{scale}/{b}")
+            results[f"{sid}: {tag}, channel {n}"] = (_slice_check(full, part, n, 3) if st == st_n == 200
+                                                     else digest(st_n, part))
+    # A single-channel dataset: channel 0 is the whole read, on production too
+    st, full = server.request("GET", "/vol1c/1/" + box(0, 64, 0, 64, 0, 32))
+    st0, part = server.request("GET", "/vol1c+channel=0/1/" + box(0, 64, 0, 64, 0, 32))
+    results[f"{sid}: vol1c channel 0"] = _slice_check(full, part, 0, 1)
+    for bad in ("3", "x", "-1", "1.0"):
+        results[f"{sid}: vol3c channel {bad}"] = digest(*server.request(
+            "GET", f"/vol3c+channel={bad}/1/" + box(0, 8, 0, 8, 0, 1)))
+    results[f"{sid}: vol1c channel 1"] = digest(*server.request("GET", "/vol1c+channel=1/1/" + box(0, 8, 0, 8, 0, 1)))
+
+
 def sc_raw_access_outside(server, results, sid):
     """raw_access over a range wider than the mchunk's stored tile (vol1c's
     mchunk (0,0,0) is 64 px wide). Production reads past the chunk buffer."""
@@ -977,6 +1019,7 @@ SCENARIOS = [
     ("s12 zero mchunk size", sc_zero_mchunk_size),
     ("s17 keep-alive connections", sc_keepalive),
     ("s18 skeleton_api writes", sc_skeleton_api_writes),
+    ("s13 channel filter", sc_channel_filter),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]

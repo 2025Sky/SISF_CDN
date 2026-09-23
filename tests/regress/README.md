@@ -66,7 +66,11 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
     server (writes off by default), on a second server with
     `SKELETON_API_WRITES=1` and its own dataset, and on one with a value
     that is not 0 or 1. Rows carry the time they were written, so the
-    file's bytes are not compared; each server records whether it changed.
+    file's bytes are not compared; each server records whether it changed;
+  - s13: `+channel=N` reads of the 3-channel fixture, each checked against
+    channel N's block of the same read without the filter (boxes, a plane,
+    a coarser level, a projection, a gaussian filter), and channels that do
+    not exist.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
