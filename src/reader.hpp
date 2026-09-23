@@ -147,6 +147,7 @@ log_limiter log_limit_stale_extent;
 log_limiter log_limit_read_refused;
 log_limiter log_limit_write_refused;
 log_limiter log_limit_write_failed;
+log_limiter log_limit_archive_meta;
 
 // https://stackoverflow.com/questions/8401777/simple-glob-in-c-on-unix-system
 std::vector<std::string> glob_tool(const std::string &pattern)
@@ -1173,6 +1174,19 @@ public:
         scales.push_back(1);
     }
 
+    // The dataset cannot be served. load_inventory catches this and prints
+    // [FAIL] for it, so it is not added, requests for it answer 404, and the
+    // next inventory scan tries it again.
+    [[noreturn]] void reject_metadata(const char *reason)
+    {
+        std::string note;
+        if (log_limit_archive_meta.allow(note))
+        {
+            std::cerr << "Dataset metadata unusable (" << reason << "): " << metadata_fname << note << std::endl;
+        }
+        throw std::runtime_error("unusable dataset metadata");
+    }
+
     void load_metadata_sisf()
     {
         metadata_fname = fname + (metadata_json ? "/metadata.json" : "/metadata.bin");
@@ -1216,19 +1230,45 @@ public:
                 ;
             }
 
+            std::streamsize bytes_read = 0;
             file.read((char *)&archive_version, sizeof(uint16_t));
+            bytes_read += file.gcount();
             file.read((char *)&dtype, sizeof(uint16_t));
+            bytes_read += file.gcount();
             file.read((char *)&channel_count, sizeof(uint16_t));
+            bytes_read += file.gcount();
 
             file.read((char *)&mchunkx, sizeof(uint16_t));
+            bytes_read += file.gcount();
             file.read((char *)&mchunky, sizeof(uint16_t));
+            bytes_read += file.gcount();
             file.read((char *)&mchunkz, sizeof(uint16_t));
+            bytes_read += file.gcount();
             file.read((char *)&resx, sizeof(uint64_t));
+            bytes_read += file.gcount();
             file.read((char *)&resy, sizeof(uint64_t));
+            bytes_read += file.gcount();
             file.read((char *)&resz, sizeof(uint64_t));
+            bytes_read += file.gcount();
             file.read((char *)&sizex, sizeof(uint64_t));
+            bytes_read += file.gcount();
             file.read((char *)&sizey, sizeof(uint64_t));
+            bytes_read += file.gcount();
             file.read((char *)&sizez, sizeof(uint64_t));
+            bytes_read += file.gcount();
+
+            // Unopenable, empty (e.g. mid-write) or cut short: the fields
+            // above were not all read
+            if (bytes_read != sizeof(uint16_t) * 6 + sizeof(uint64_t) * 6)
+            {
+                reject_metadata("short read");
+            }
+        }
+
+        // The mchunk counts below divide by these
+        if (mchunkx == 0 || mchunky == 0 || mchunkz == 0)
+        {
+            reject_metadata("mchunk size 0");
         }
 
         mcountx = (sizex + mchunkx - 1) / mchunkx;
