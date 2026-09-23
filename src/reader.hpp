@@ -318,14 +318,23 @@ public:
         return (ix * countz * county) + (iy * countz) + iz;
     }
 
-    metadata_entry *load_meta_entry(size_t id)
+    // *failed is set when the entry could not be read, as opposed to a chunk
+    // that was never written (size 0).
+    metadata_entry *load_meta_entry(size_t id, bool *failed = nullptr)
     {
         metadata_entry *out = (metadata_entry *)malloc(sizeof(metadata_entry));
+        if (out == NULL)
+        {
+            if (failed != nullptr)
+                *failed = true;
+            return NULL;
+        }
         out->offset = 0;
         out->size = 0;
 
         const size_t offset = header_size + (entry_file_line_size * id);
 
+        bool read_ok = false;
         for (size_t i = 0; i < IO_RETRY_COUNT; i++)
         {
             std::ifstream file(meta_fname, std::ios::in | std::ios::binary);
@@ -355,7 +364,17 @@ public:
                 continue;
             }
 
+            read_ok = true;
             break;
+        }
+
+        if (!read_ok)
+        {
+            // A short read can leave part of a size behind
+            out->offset = 0;
+            out->size = 0;
+            if (failed != nullptr)
+                *failed = true;
         }
 
         return out;
@@ -386,15 +405,29 @@ public:
     std::mutex chunk_cache_mutex;
     std::deque<std::tuple<size_t, uint16_t *>> chunk_cache;
 
-    uint16_t *load_chunk(size_t id, size_t sizex, size_t sizey, size_t sizez)
+    // Returns the chunk, or zeros when it was never written or cannot be read
+    // or decoded; *failed tells those two apart. NULL only if even the zero
+    // buffer cannot be allocated.
+    uint16_t *load_chunk(size_t id, size_t sizex, size_t sizey, size_t sizez, bool *failed = nullptr)
     {
         const size_t out_buffer_size = sizex * sizey * sizez * sizeof(uint16_t);
         uint16_t *out = (uint16_t *)calloc(out_buffer_size, 1);
-        metadata_entry *sel = load_meta_entry(id);
-
-        if (sel->size == 0)
+        if (out == NULL)
         {
-            // Failed to read metadata (impossible for chunk size to be 0)
+            std::cerr << "Chunk read failed (out of memory): " << data_fname << " chunk " << id << std::endl;
+            if (failed != nullptr)
+                *failed = true;
+            return NULL;
+        }
+
+        bool entry_failed = false;
+        metadata_entry *sel = load_meta_entry(id, &entry_failed);
+
+        if (sel == NULL || sel->size == 0)
+        {
+            // Never written, or the entry could not be read
+            if (entry_failed && failed != nullptr)
+                *failed = true;
             free(sel);
             return out;
         }
@@ -431,6 +464,14 @@ public:
             // Read from file
             size_t buffer_size = sel->size;
             uint16_t *read_buffer = (uint16_t *)malloc(buffer_size);
+            if (read_buffer == NULL)
+            {
+                std::cerr << "Chunk read failed (out of memory): " << data_fname << " chunk " << id << std::endl;
+                if (failed != nullptr)
+                    *failed = true;
+                free(sel);
+                return out;
+            }
 
             bool read_failed = true;
             for (size_t i = 0; i < IO_RETRY_COUNT; i++)
@@ -460,15 +501,18 @@ public:
             if (read_failed)
             {
                 // std::cerr << "Read failed (max retries)" << std::endl;
+                if (failed != nullptr)
+                    *failed = true;
                 free(read_buffer);
                 free(sel);
                 return out;
             }
 
             // Decompress
-            size_t decomp_size;
-            char *read_decomp_buffer;
+            size_t decomp_size = 0;
+            char *read_decomp_buffer = NULL;
             pixtype *read_decomp_buffer_pt;
+            const char *decode_error = NULL;
 
             uint32_t height, width, depth = 0;
 
@@ -480,11 +524,21 @@ public:
             case 1:
                 // Decompress with ZSTD
                 read_decomp_buffer = (char *)calloc(out_buffer_size, 1);
+                if (read_decomp_buffer == NULL)
+                {
+                    decode_error = "out of memory";
+                    break;
+                }
                 decomp_size = ZSTD_decompress(read_decomp_buffer, out_buffer_size, read_buffer, sel->size);
+                if (ZSTD_isError(decomp_size))
+                {
+                    decode_error = ZSTD_getErrorName(decomp_size);
+                }
                 break;
 
             case 2:
             case 3:
+            {
                 // Decompress with vidlib 2
                 // read_decomp_buffer_pt = decode_stack_AV1(sizex, sizey, sizez, read_buffer, sel->size);
                 auto decode_result = decode_stack_native(read_buffer, sel->size);
@@ -496,7 +550,11 @@ public:
                 height = std::get<1>(std::get<2>(decode_result));
                 depth = std::get<2>(std::get<2>(decode_result));
 
-                if (std::get<3>(decode_result) == sizeof(uint8_t))
+                if (read_decomp_buffer_pt == NULL)
+                {
+                    decode_error = "video decode returned no frames";
+                }
+                else if (std::get<3>(decode_result) == sizeof(uint8_t))
                 {
                     read_decomp_buffer = (char *)uint8_to_uint16_crop(read_decomp_buffer_pt, decomp_size, width, height, depth, sizex, sizey, sizez);
                     decomp_size = sizex * sizey * sizez * sizeof(uint16_t);
@@ -511,12 +569,35 @@ public:
                 else
                 {
                     std::cerr << "decode_stack_native returned unexpected pixel size" << std::endl;
+                    decode_error = "unexpected pixel size";
+                    free(read_decomp_buffer_pt);
                 }
 
                 break;
             }
 
+            default:
+                decode_error = "unknown compression type";
+                break;
+            }
+
             free(read_buffer);
+
+            if (decode_error == NULL && decomp_size != out_buffer_size)
+            {
+                decode_error = "decoded size does not match the chunk";
+            }
+
+            if (decode_error != NULL)
+            {
+                std::cerr << "Chunk decode failed (" << decode_error << "): " << data_fname << " chunk " << id
+                          << " compression " << compression_type << " decoded " << decomp_size << " expected " << out_buffer_size << std::endl;
+                if (failed != nullptr)
+                    *failed = true;
+                free(read_decomp_buffer);
+                free(sel);
+                return out;
+            }
 
             // Copy result
             memcpy((void *)out, (void *)read_decomp_buffer, decomp_size);
@@ -1302,6 +1383,10 @@ public:
 
         // Allocate buffer for output
         uint16_t *out_buffer = (uint16_t *)calloc(buffer_size, 1);
+        if (out_buffer == NULL)
+        {
+            return NULL;
+        }
 
         if (type == SISF)
         {
@@ -1325,6 +1410,9 @@ public:
             size_t cxmin, cxmax, cxsize;
             size_t cymin, cymax, cysize;
             size_t czmin, czmax, czsize;
+
+            // Voxels that fall outside their stored tile read as 0
+            size_t outside_voxels = 0;
 
             for (size_t c = 0; c < channel_count; c++)
             {
@@ -1392,6 +1480,22 @@ public:
                             const size_t y_in_chunk_offset = y_in_chunk + chunk_reader->cropstarty;
                             const size_t z_in_chunk_offset = z_in_chunk + chunk_reader->cropstartz;
 
+                            // Outside the stored tile, e.g. when the archive geometry is stale after
+                            // an in-place re-conversion. find_index would name a chunk that is not this one.
+                            if (x_in_chunk_offset >= chunk_reader->sizex ||
+                                y_in_chunk_offset >= chunk_reader->sizey ||
+                                z_in_chunk_offset >= chunk_reader->sizez)
+                            {
+                                outside_voxels++;
+                                if (force && chunk_identifier != nullptr)
+                                {
+                                    // Make the next voxel start over; the cached chunk belongs to the previous mchunk
+                                    delete chunk_identifier;
+                                    chunk_identifier = nullptr;
+                                }
+                                continue;
+                            }
+
                             // Find sub chunk id from coordinates
                             sub_chunk_id = chunk_reader->find_index(x_in_chunk_offset, y_in_chunk_offset, z_in_chunk_offset);
 
@@ -1419,6 +1523,14 @@ public:
                                 czmax = std::min((size_t)czmin + chunk_reader->chunkz, (size_t)chunk_reader->sizez);
                                 czsize = czmax - czmin;
 
+                                if (cxmax <= cxmin || cymax <= cymin || czmax <= czmin)
+                                {
+                                    outside_voxels++;
+                                    delete chunk_identifier;
+                                    chunk_identifier = nullptr;
+                                    continue;
+                                }
+
                                 // Check if the chunk is in the tmp cache
                                 chunk = chunk_cache[*chunk_identifier];
                                 if (chunk == 0)
@@ -1430,6 +1542,12 @@ public:
                                 // Store this ID as the most recent chunk
                                 last_sub = sub_chunk_id;
                                 last_c = c;
+                            }
+
+                            if (chunk == nullptr)
+                            {
+                                // Out of memory in load_chunk; read as 0
+                                continue;
                             }
 
                             // Calculate the coordinates of the input and output inside their respective buffers
@@ -1456,6 +1574,13 @@ public:
             for (auto it = chunk_cache.begin(); it != chunk_cache.end(); it++)
             {
                 free(it->second);
+            }
+
+            if (outside_voxels > 0)
+            {
+                std::cerr << "Read outside stored tiles: " << outside_voxels << " voxels read as 0 in " << fname
+                          << " scale " << scale << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze
+                          << " (archive geometry may be stale)" << std::endl;
             }
         }
         else if (type == ZARR)
