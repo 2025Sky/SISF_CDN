@@ -1817,7 +1817,12 @@ int main(int argc, char *argv[])
 
 		unsigned int x_begin, x_end, y_begin, y_end, z_begin, z_end;
 		// <xBegin>-<xEnd>_<yBegin>-<yEnd>_<zBegin>-<zEnd>
-		sscanf(tile_key.c_str(), "%u-%u_%u-%u_%u-%u", &x_begin, &x_end, &y_begin, &y_end, &z_begin, &z_end);
+		if (sscanf(tile_key.c_str(), "%u-%u_%u-%u_%u-%u", &x_begin, &x_end, &y_begin, &y_end, &z_begin, &z_end) != 6)
+		{
+			res.code = crow::status::BAD_REQUEST;
+			res.end("Bad Request -- invalid range");
+			return;
+		}
 
 		size_t chunk_sizes[3] = {x_end - x_begin, y_end - y_begin, z_end - z_begin};
 		size_t scale = stoi(resolution_id);
@@ -1847,18 +1852,11 @@ int main(int argc, char *argv[])
 
 		packed_reader * chunk_reader = reader->get_mchunk(scale, channel, chunk_i, chunk_j, chunk_k);
 
-		if(chunk_reader == nullptr || chunk_reader == 0) {
+		if(chunk_reader == nullptr || chunk_reader == 0 || !chunk_reader->is_valid) {
             res.code = crow::status::NOT_FOUND;
 			res.end("404 Not Found\n");
 			return;
         }
-
-		uint16_t * out_buffer = (uint16_t*) malloc(out_buffer_size);
-
-		uint16_t * chunk = nullptr;
-		size_t last_sub_chunk_id = SIZE_MAX;
-
-		std::map<size_t, uint16_t *> chunk_cache;
 
 		const size_t sx = chunk_reader->sizex;
 		const size_t sy = chunk_reader->sizey;
@@ -1867,6 +1865,31 @@ int main(int argc, char *argv[])
 		const size_t mchunkx = chunk_reader->chunkx;
 		const size_t mchunky = chunk_reader->chunky;
 		const size_t mchunkz = chunk_reader->chunkz;
+
+		// The range must lie inside this mchunk's stored tile: the chunk
+		// bounds below are clamped to it, and a voxel past it would index
+		// past its chunk buffer
+		if (x_begin > x_end || y_begin > y_end || z_begin > z_end ||
+			x_end > sx || y_end > sy || z_end > sz ||
+			mchunkx == 0 || mchunky == 0 || mchunkz == 0)
+		{
+			res.code = crow::status::BAD_REQUEST;
+			res.end("Bad Request -- range outside chunk");
+			return;
+		}
+
+		uint16_t * out_buffer = (uint16_t*) malloc(out_buffer_size);
+		if (out_buffer == NULL)
+		{
+			res.code = crow::status::INTERNAL_SERVER_ERROR;
+			res.end("500 Internal Server Error -- Out of memory\n");
+			return;
+		}
+
+		uint16_t * chunk = nullptr;
+		size_t last_sub_chunk_id = SIZE_MAX;
+
+		std::map<size_t, uint16_t *> chunk_cache;
 
 		for (size_t i = x_begin; i < x_end; i++)
 		{
@@ -1915,7 +1938,8 @@ int main(int argc, char *argv[])
 										   ((j - y_begin) * chunk_sizes[0]) +				   // Y
 										   (i - x_begin);									   // X
 
-					const uint16_t v = chunk[coffset];
+					// A NULL chunk (out of memory) reads as 0
+					const uint16_t v = chunk == nullptr ? 0 : chunk[coffset];
 					out_buffer[ooffset] = v;
 				}
 			}
@@ -2272,6 +2296,12 @@ int main(int argc, char *argv[])
 
 		if(project_frames > 1) {
 			out_buffer = (uint16_t *) calloc(out_buffer_size, 1);
+			if (out_buffer == NULL)
+			{
+				res.code = crow::status::INTERNAL_SERVER_ERROR;
+				res.end("500 Internal Server Error -- Out of memory\n");
+				return;
+			}
 
 			switch(project_axis) {
 				case 'x':
@@ -2323,6 +2353,13 @@ int main(int argc, char *argv[])
 				z_begin_project, z_end_project,
 				strict_read ? &read_failed : nullptr
 			);
+			if (tmp_buffer == NULL)
+			{
+				free(out_buffer);
+				res.code = crow::status::INTERNAL_SERVER_ERROR;
+				res.end("500 Internal Server Error -- Out of memory\n");
+				return;
+			}
 
 			uint16_t vout;
 			double sum;
