@@ -1546,11 +1546,11 @@ public:
         return out;
     }
 
-    // With failed set, a chunk that exists but cannot be read (the .meta or
-    // .data cannot be opened or is short, the data does not decode, memory
-    // runs out, the mchunk header is unusable) sets *failed; its voxels read
-    // as 0 either way. A chunk never written or a missing mchunk is not a
-    // failure.
+    // With failed set, a chunk that cannot be read (the .meta or .data cannot
+    // be opened or is short, the data does not decode, memory runs out, the
+    // mchunk header is unusable, no reader can be built for its mchunk) sets
+    // *failed; its voxels read as 0 either way. A chunk never written is not
+    // a failure.
     uint16_t *load_region(
         size_t scale,
         size_t xs, size_t xe,
@@ -1650,6 +1650,10 @@ public:
 
                                 if (chunk_reader == nullptr || chunk_reader == 0)
                                 {
+                                    // No reader could be built: the .meta is missing, cannot be
+                                    // opened or has an unusable header
+                                    if (failed != nullptr)
+                                        *failed = true;
                                     if (!is_bad)
                                     {
                                         back_mchunks.insert({scale, c, chunk_id_x, chunk_id_y, chunk_id_z});

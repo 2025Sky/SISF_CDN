@@ -2229,9 +2229,11 @@ int main(int argc, char *argv[])
 
 		// The portal sends its token on the read before every PATCH, whose
 		// answer it merges and writes back, and on its algorithm reads;
-		// viewers send none. Such a read fails with 500 when a chunk that
-		// exists could not be read, instead of answering zeros for it that
-		// the portal would then write over the stored labels.
+		// viewers send none. Such a read fails with 500 when a chunk could
+		// not be read, instead of answering zeros for it that the portal
+		// would then write over the stored labels. That includes an mchunk
+		// with no usable .meta: a writable layer has one for every mchunk,
+		// and the PATCH that follows refuses a missing mchunk anyway.
 		bool strict_read = false;
 		for (const auto &pair : filters)
 		{
