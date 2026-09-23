@@ -250,6 +250,13 @@ public:
 
     std::string meta_fname, data_fname;
 
+    // Bumped, under global_chunk_cache_mutex, after a chunk of this mchunk is
+    // rewritten and when its cache lines are dropped. load_chunk samples it
+    // before reading a chunk's entry and puts its decode in the global cache
+    // only if it has not moved: a decode begun before a write finished may be
+    // of the old chunk, and the write's invalidation has already run.
+    std::atomic<uint64_t> data_gen{0};
+
     packed_reader(size_t chunk_id, std::string metadata_fname_in, std::string data_fname_in)
     {
         is_valid = false;
@@ -285,6 +292,8 @@ public:
     void clear_cache_lines()
     {
         global_chunk_cache_mutex.lock();
+        // A decode made under the header being replaced must not come back
+        data_gen.fetch_add(1);
         for (size_t i = 0; i < global_cache_size; i++)
         {
             if (global_chunk_cache[i].mchunk == this_mchunk_id)
@@ -543,6 +552,9 @@ public:
             return NULL;
         }
 
+        // Before the entry is read; see data_gen
+        const uint64_t gen = data_gen.load();
+
         bool entry_failed = false;
         metadata_entry *sel = load_meta_entry(id, &entry_failed);
 
@@ -745,7 +757,16 @@ public:
             // Copy result
             memcpy((void *)out, (void *)read_decomp_buffer, decomp_size);
 
-            if (global_chunk_cache_mutex.try_lock_for(cache_lock_timeout))
+            bool cache_locked = global_chunk_cache_mutex.try_lock_for(cache_lock_timeout);
+            if (cache_locked && data_gen.load() != gen)
+            {
+                // A write to this mchunk finished while this chunk was read, so this
+                // decode may be the chunk it replaced
+                global_chunk_cache_mutex.unlock();
+                cache_locked = false;
+            }
+
+            if (cache_locked)
             {
                 global_chunk_line *cache_line = global_chunk_cache + global_chunk_cache_last;
 
@@ -845,6 +866,10 @@ public:
             // Update cached mtime so our own write is not detected as
             // an external modification on the next read.
             last_meta_read_time = get_file_mtime_ns(meta_fname);
+
+            // After the entry is on disk and before the lines are dropped: a
+            // reader that sampled data_gen before this will not insert
+            data_gen.fetch_add(1);
 
             // Delete the prexisting values in the cache
             for (size_t i = 0; i < global_cache_size; i++)
