@@ -9,10 +9,15 @@ Reads are compared by status code and SHA-256 of the body. Writes are sent to
 each server's own copy of the data in the same order the SAVAII portal sends
 them (read a 128-aligned box, merge labels, PATCH it back), then compared both
 through re-reads and byte-for-byte on disk. A server that dies is recorded as
-CRASH for that request, restarted, and the run continues.
+CRASH for that request, restarted, and the run continues; one that stays up
+but does not answer in time is recorded as TIMEOUT.
 
-Exit status: 0 when every difference is listed in the allow file and neither
-server crashed differently from the other, 1 otherwise.
+Exit status: 0 when every difference is listed in the allow file, every
+difference the allow file lists actually occurred, and the candidate never
+crashed or timed out; 1 otherwise. A candidate crash fails the run even where
+the baseline crashes too, because two crashes compare as equal, and a listed
+difference that did not occur means the candidate behaves like the baseline
+there again.
 """
 
 import argparse
@@ -20,6 +25,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -34,6 +40,8 @@ import fixtures
 READ_DATASETS = ["vol1c", "vol3c", "tiled2d", "tiled3d", "plane2d", "seg_empty", "seg_prefilled", "seg_holes"]
 NG_CHUNKS = [(256, 256, 1), (256, 1, 256), (1, 256, 256), (32, 32, 32)]
 FULL_READ_LIMIT = 4_000_000  # voxels x channels; above this only boxes are read
+RES = (650, 650, 1500)
+SCENARIO_TIMEOUT = 20  # s; a write stuck on a leaked lock never answers
 
 
 class Server:
@@ -52,6 +60,11 @@ class Server:
 
     def restart(self):
         subprocess.run(["docker", "start", self.name], check=True, capture_output=True)
+        self._wait()
+
+    def restart_running(self):
+        """For a server that is up but wedged (e.g. a thread stuck on a lock)."""
+        subprocess.run(["docker", "restart", "-t", "5", self.name], check=True, capture_output=True)
         self._wait()
 
     def _wait(self):
@@ -77,18 +90,23 @@ class Server:
         r = subprocess.run(["docker", "logs", "--tail", str(n), self.name], capture_output=True, text=True)
         return (r.stdout + r.stderr).strip().splitlines()
 
+    def save_logs(self, path):
+        with open(path, "w") as f:
+            subprocess.run(["docker", "logs", self.name], stdout=f, stderr=subprocess.STDOUT)
+
     def stop(self):
         subprocess.run(["docker", "stop", "-t", "5", self.name], capture_output=True)
 
     def remove(self):
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
 
-    def request(self, method, path, body=None):
+    def request(self, method, path, body=None, timeout=120):
         """Returns (status, body bytes). status is 'CRASH' if the server died,
-        'NOCONN' if it is alive but the connection failed."""
+        'TIMEOUT' if it is alive but did not answer within timeout seconds,
+        'NOCONN' if it is alive but the connection failed otherwise."""
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=body, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return r.status, r.read()
         except urllib.error.HTTPError as e:
             return e.code, e.read()
@@ -99,6 +117,8 @@ class Server:
                 tail = self.logs_tail()
                 self.restart()
                 return "CRASH", f"exit={code}; {' | '.join(tail[-4:])}; {type(e).__name__}"
+            if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+                return "TIMEOUT", f"no response within {timeout} s"
             return "NOCONN", f"{type(e).__name__}: {e}"
 
 
@@ -206,9 +226,8 @@ DANGER_PLAN = [
     ("d03 box beyond size", f"/seg_empty+token={fixtures.TOKEN}/write/1/" + box(150, 190, 0, 32, 0, 32), None),
     ("d04 scale 2", f"/seg_empty+token={fixtures.TOKEN}/write/2/" + box(0, 32, 0, 32, 0, 32), None),
     ("d05 empty box", f"/seg_empty+token={fixtures.TOKEN}/write/1/" + box(5, 5, 0, 32, 0, 32), 0),
-    # Straddles present mchunk (0,0,0) and the missing (1,0,0). Production skips
-    # the missing part and answers 200; upstream without Bin's bcb9bb1
-    # dereferences a null reader.
+    # Straddles present mchunk (0,0,0) and the missing (1,0,0). Production
+    # dereferences the null reader for the missing one and dies (exit 139).
     ("d06 write across missing mchunk", f"/seg_holes+token={fixtures.TOKEN}/write/1/" + box(64, 128, 0, 32, 0, 32),
      64 * 32 * 32),
 ]
@@ -254,6 +273,123 @@ def run_danger(server, results):
             server.restart()
 
 
+def sc_stale_geometry(server, results, sid):
+    """The 2026-08-30 production abort: a tiled dataset is served, re-converted
+    in place with a larger overlap (the CDN keeps the old tile step from
+    metadata.bin), then an alignment moves one tile's crop start in x and y to
+    the top of its new margin, and that tile is read."""
+    ds, tile = "sc_stale", (96, 96, 1)
+    root = os.path.join(server.data_dir, ds)
+    fixtures.tiled(root, 1, (3, 2, 1), tile, (24, 24, 0), RES, 3)  # step 72
+    time.sleep(1.2)  # the CDN compares .meta mtimes in whole seconds
+    results[f"{sid}: read before"] = digest(*server.request("GET", f"/{ds}/1/" + box(0, 216, 0, 144, 0, 1)))
+    fixtures.tiled(root, 1, (3, 2, 1), tile, (32, 32, 0), RES, 3)  # in place, step 64
+    time.sleep(1.2)
+    results[f"{sid}: read after re-conversion"] = digest(*server.request("GET", f"/{ds}/1/" + box(0, 192, 0, 128, 0, 1)))
+    margin = 32
+    for scale in ("1X", "2X"):
+        p = os.path.join(root, "meta", f"chunk_1_0_0.0.{scale}.meta")
+        if not os.path.exists(p):
+            continue
+        f_ = 1 if scale == "1X" else 2
+        with open(p, "r+b") as f:
+            v = list(struct.unpack(fixtures.SHARD_HEADER_LAYOUT, f.read(86)))
+            w = v[11] - v[10]; v[10] = margin // f_; v[11] = v[10] + w
+            h = v[13] - v[12]; v[12] = margin // f_; v[13] = v[12] + h
+            f.seek(0)
+            f.write(struct.pack(fixtures.SHARD_HEADER_LAYOUT, *v))
+    time.sleep(1.2)
+    results[f"{sid}: read aligned tile"] = digest(*server.request("GET", f"/{ds}/1/" + box(72, 144, 0, 72, 0, 1)))
+
+
+def _vol(root):
+    fixtures.untiled(root, fixtures.pattern((1, 100, 90, 37), 1), (64, 64, 32), RES, 2)
+
+
+def sc_corrupt_zstd(server, results, sid):
+    """One chunk's zstd frame has a broken magic number."""
+    ds = "sc_zstd"
+    root = os.path.join(server.data_dir, ds)
+    _vol(root)
+    with open(os.path.join(root, "meta", "chunk_0_0_0.0.1X.meta"), "rb") as f:
+        f.seek(86 + 12 * 1)  # chunk 1: x 0-32, y 32-64, z 0-32
+        offset, size = struct.unpack(fixtures.SHARD_LINE_LAYOUT, f.read(12))
+    with open(os.path.join(root, "data", "chunk_0_0_0.0.1X.data"), "r+b") as f:
+        f.seek(offset)
+        f.write(b"\0\0\0\0")
+    results[f"{sid}: read"] = digest(*server.request("GET", f"/{ds}/1/" + box(0, 64, 0, 64, 0, 32)))
+
+
+def sc_bad_compression(server, results, sid):
+    """An mchunk header names a compression type that does not exist."""
+    ds = "sc_comp"
+    root = os.path.join(server.data_dir, ds)
+    _vol(root)
+    with open(os.path.join(root, "meta", "chunk_0_0_0.0.1X.meta"), "r+b") as f:
+        f.seek(6)  # version, dtype, channels, compression
+        f.write(struct.pack("<H", 9))
+    results[f"{sid}: read"] = digest(*server.request("GET", f"/{ds}/1/" + box(0, 64, 0, 64, 0, 32)))
+
+
+def sc_missing_data(server, results, sid):
+    """A writable layer whose .data file for mchunk (0,0,0) is gone (its .meta
+    is still there). Production answers the first PATCH with 200 and leaks the
+    global chunk lock, so the next PATCH anywhere hangs."""
+    ds = "sc_nodata"
+    root = os.path.join(server.data_dir, ds)
+    fixtures.segmentation(root, (160, 150, 70), (96, 96, 48), RES)
+    os.remove(os.path.join(root, "data", "chunk_0_0_0.0.1X.data"))
+    body = np.full(32 * 32 * 32, 3, dtype=np.uint16).tobytes()
+    w = f"/{ds}+token={fixtures.TOKEN}/write/1/"
+    results[f"{sid}: PATCH into it"] = digest(*server.request("PATCH", w + box(0, 32, 0, 32, 0, 32), body,
+                                                             timeout=SCENARIO_TIMEOUT))
+    results[f"{sid}: second PATCH elsewhere"] = digest(*server.request("PATCH", w + box(96, 128, 0, 32, 0, 32), body,
+                                                                      timeout=SCENARIO_TIMEOUT))
+    if any(results[k]["status"] == "TIMEOUT" for k in results if k.startswith(sid)):
+        server.restart_running()
+
+
+def sc_unreadable_chunk_write(server, results, sid):
+    """A prefilled writable layer whose .data is cut short inside the last
+    chunk of mchunk (0,0,0), then a PATCH covering part of that chunk.
+    Production reads the chunk as zeros, merges the request into them and
+    writes the result back with 200, so the chunk's other voxels become 0."""
+    ds = "sc_short"
+    root = os.path.join(server.data_dir, ds)
+    fixtures.segmentation(root, (100, 90, 37), (64, 64, 32), RES, prefill_seed=5)
+    with open(os.path.join(root, "meta", "chunk_0_0_0.0.1X.meta"), "rb") as f:
+        f.seek(86 + 12 * 3)  # chunk 3: x 32-64, y 32-64, z 0-32, the last frame in the file
+        offset, size = struct.unpack(fixtures.SHARD_LINE_LAYOUT, f.read(12))
+    with open(os.path.join(root, "data", "chunk_0_0_0.0.1X.data"), "r+b") as f:
+        f.truncate(offset + size // 2)
+    body = np.full(16 * 16 * 16, 3, dtype=np.uint16).tobytes()
+    results[f"{sid}: PATCH part of the chunk"] = digest(*server.request(
+        "PATCH", f"/{ds}+token={fixtures.TOKEN}/write/1/" + box(40, 56, 40, 56, 0, 16), body))
+    results[f"{sid}: read the chunk back"] = digest(*server.request("GET", f"/{ds}/1/" + box(32, 64, 32, 64, 0, 32)))
+
+
+# Cases where production dies, hangs or loses data. Each builds its own dataset
+# while the server runs (the first request for it triggers the inventory re-scan).
+SCENARIOS = [
+    ("s1 stale geometry", sc_stale_geometry),
+    ("s2 corrupt zstd frame", sc_corrupt_zstd),
+    ("s3 bad compression type", sc_bad_compression),
+    ("s4 missing .data", sc_missing_data),
+    ("s5 unreadable chunk under a PATCH", sc_unreadable_chunk_write),
+]
+SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short"]
+
+
+def run_scenarios(server, results):
+    for sid, fn in SCENARIOS:
+        fn(server, results, sid)
+        alive, code = server.running()
+        results[f"{sid} (alive after)"] = {"status": "alive" if alive else f"dead exit={code}",
+                                           "len": None, "sha256": None, "text": None}
+        if not alive:
+            server.restart()
+
+
 def reread(server, info_by_ds, results, tag):
     for ds in ("seg_empty", "seg_prefilled", "seg_holes"):
         info = info_by_ds[ds]
@@ -265,7 +401,7 @@ def reread(server, info_by_ds, results, tag):
 
 def disk_hashes(root):
     out = {}
-    for ds in ("seg_empty", "seg_prefilled", "seg_holes"):
+    for ds in ["seg_empty", "seg_prefilled", "seg_holes"] + SCENARIO_DATASETS:
         for dirpath, _, files in os.walk(os.path.join(root, ds)):
             for f in files:
                 path = os.path.join(dirpath, f)
@@ -325,7 +461,8 @@ def main():
         shutil.copytree(os.path.join(work, "fixtures"), d)
         servers.append(Server(role, image, plat, d))
 
-    report = {"baseline": args.baseline, "candidate": args.candidate, "diffs": [], "counts": {}, "results": {}, "crashes": []}
+    report = {"baseline": args.baseline, "candidate": args.candidate, "diffs": [], "counts": {}, "results": {},
+              "crashes": [], "timeouts": []}
     try:
         for s in servers:
             s.start()
@@ -346,7 +483,8 @@ def main():
         stages = [("reads", reads), ("writes", run_writes),
                   ("reread", lambda s, r: reread(s, info_by_ds, r, "after-writes"))]
         if not args.skip_danger:
-            stages += [("danger", run_danger), ("reread2", lambda s, r: reread(s, info_by_ds, r, "after-danger"))]
+            stages += [("danger", run_danger), ("reread2", lambda s, r: reread(s, info_by_ds, r, "after-danger")),
+                       ("scenarios", run_scenarios)]
         seg_full = "GET /seg_empty/1/" + box(0, 160, 0, 150, 0, 70) + " [full]"
         for name, fn in stages:
             t0 = time.time()
@@ -359,6 +497,8 @@ def main():
             for role in ("baseline", "candidate"):
                 report["crashes"] += [{"role": role, "stage": name, "id": k, "text": v["text"]}
                                       for k, v in res[role].items() if v["status"] == "CRASH"]
+                report["timeouts"] += [{"role": role, "stage": name, "id": k, "text": v["text"]}
+                                       for k, v in res[role].items() if v["status"] == "TIMEOUT"]
             print(f"{name}: {len(res['baseline'])} requests, {len(d)} differ", flush=True)
             if name == "reads":
                 before = res["baseline"].get(seg_full)
@@ -371,6 +511,7 @@ def main():
     finally:
         for s in servers:
             s.stop()
+            s.save_logs(os.path.join(work, f"{s.role}.log"))
 
     ha, hb = disk_hashes(servers[0].data_dir), disk_hashes(servers[1].data_dir)
     disk = [{"id": f"disk {k}", "baseline": {"status": "file", "sha256": ha.get(k), "len": None, "text": None},
@@ -385,6 +526,11 @@ def main():
 
     unexpected = [d for d in report["diffs"] if not d["allowed"]]
     report["unexpected"] = len(unexpected)
+    candidate_failures = [c for c in report["crashes"] + report["timeouts"] if c["role"] == "candidate"]
+    report["candidate_crashes_or_timeouts"] = len(candidate_failures)
+    seen = {d["id"] for d in report["diffs"]}
+    not_seen = sorted(k for k in allow if k not in seen)
+    report["expected_not_seen"] = not_seen
     if args.report:
         with open(args.report, "w") as f:
             json.dump(report, f, indent=1)
@@ -393,9 +539,15 @@ def main():
         print(f"[{mark}] {d['stage']}: {d['id']}\n    baseline:  {d['baseline']}\n    candidate: {d['candidate']}")
     for c in report["crashes"]:
         print(f"[CRASH] {c['role']} {c['stage']}: {c['id']}\n    {c['text']}")
+    for c in report["timeouts"]:
+        print(f"[TIMEOUT] {c['role']} {c['stage']}: {c['id']}\n    {c['text']}")
+    for k in not_seen:
+        print(f"[EXPECTED, NOT SEEN] {k}\n    {allow[k]}")
     print(f"RESULT: {len(report['diffs'])} differences, {len(unexpected)} unexpected, "
-          f"{len(report['crashes'])} crashes (baseline and candidate counted separately)")
-    return 1 if unexpected else 0
+          f"{len(report['crashes'])} crashes, {len(report['timeouts'])} timeouts "
+          f"(baseline and candidate counted separately); candidate crashed or timed out {len(candidate_failures)} times; "
+          f"{len(not_seen)} expected differences not seen")
+    return 1 if unexpected or candidate_failures or not_seen else 0
 
 
 if __name__ == "__main__":

@@ -1,3 +1,14 @@
 [
-  {"id": "GET /version", "reason": "the fork reports V0.13.1-cai1; production reports V0.13.1"}
+  {"id": "GET /version", "reason": "the fork reports V0.13.1-cai1; production reports V0.13.1"},
+  {"id": "d06 write across missing mchunk", "reason": "production dereferences the null reader of the missing mchunk (1,0,0) in replace_region and dies (exit 139); the fork refuses the whole write with 500 'Missing mchunk' before writing anything, and seg_holes on disk is identical on both sides"},
+  {"id": "s1 stale geometry: read aligned tile", "reason": "production aborts (exit 134, buffer overflow detected): under the stale 72-pixel tile step the crop-shifted x and y offsets run past the 96-pixel tile; the fork answers 200, reads the 1088 voxels whose offset is past the tile as 0 and the rest from the tile"},
+  {"id": "s2 corrupt zstd frame: read", "reason": "production aborts (exit 134, buffer overflow detected) on the undecodable frame; the fork answers 200 with chunk 1 of mchunk (0,0,0) (x 0-32, y 32-64, z 0-32) as zeros and every other voxel unchanged, and logs one 'Chunk decode failed' line naming the file and chunk"},
+  {"id": "s4 missing .data: PATCH into it", "reason": "production answers 200 'done.' although nothing was written (the .data open failed) and leaks the global chunk lock; the fork answers 500 'Could not write chunk' and releases the lock"},
+  {"id": "s4 missing .data: second PATCH elsewhere", "reason": "production never answers (the write blocks on the lock leaked by the previous PATCH); the fork writes it and answers 200"},
+  {"id": "disk sc_nodata/data/chunk_1_0_0.0.1X.data", "reason": "written by the second PATCH on the fork; production hung before writing it"},
+  {"id": "disk sc_nodata/meta/chunk_1_0_0.0.1X.meta", "reason": "entry updated by the second PATCH on the fork; production hung before writing it"},
+  {"id": "s5 unreadable chunk under a PATCH: PATCH part of the chunk", "reason": "production reads the cut-short chunk as zeros, merges the request into them, writes the result back and answers 200; the fork refuses the whole write with 500 'Could not read existing chunk' and writes nothing"},
+  {"id": "s5 unreadable chunk under a PATCH: read the chunk back", "reason": "on production the chunk now holds the request's 16x16x16 voxels and zeros everywhere else (its other voxels were overwritten); on the fork the chunk is unchanged on disk and still unreadable, so it reads as zeros"},
+  {"id": "disk sc_short/data/chunk_0_0_0.0.1X.data", "reason": "production appended the zero-filled chunk; the fork wrote nothing (identical to the fixture)"},
+  {"id": "disk sc_short/meta/chunk_0_0_0.0.1X.meta", "reason": "production repointed chunk 3's entry at the appended frame; the fork wrote nothing (identical to the fixture)"}
 ]
