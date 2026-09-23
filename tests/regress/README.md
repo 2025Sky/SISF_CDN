@@ -40,15 +40,18 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
   - s8: a `raw_access` read wider than the mchunk's stored tile.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
-  `len`, `sha256`, `text` for a response, `sha256` for a file, or
-  `"unchanged"` for a file that must still equal the dataset as built. An
-  entry without `expect` is allowed only where the candidate's answer
-  legitimately varies, and its reason must say why; the run lists such
-  entries. Anything not listed fails the run, and so does any candidate
-  CRASH or TIMEOUT (even where the baseline crashes the same way), a listed
-  difference that did not occur (the candidate behaves like the baseline
-  there again), and a listed difference where the candidate's answer is not
-  the expected one.
+  `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
+  response, `sha256` for a file, or `"unchanged"` for a file that must still
+  equal the dataset as built. An entry whose `expect` is missing or empty,
+  or pins only the status of a 200 that has a body, fails the run unless it
+  carries `"unpinned_reason"` saying why the answer cannot be pinned; the
+  run lists those. `expect_baseline` pins the baseline's answer the same
+  way where it is deterministic, e.g. a crash that shows the case reaches
+  the production bug. Anything not listed fails the run, and so does any
+  candidate CRASH or TIMEOUT (even where the baseline crashes the same way),
+  a listed difference that did not occur (the candidate behaves like the
+  baseline there again), and a listed difference where an answer is not the
+  expected one.
 - Each server's full log is saved to `<work>/<role>.log`.
 
 Compare like with like: run both images on amd64. An integer division by zero

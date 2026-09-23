@@ -13,8 +13,9 @@ CRASH for that request, restarted, and the run continues; one that stays up
 but does not answer in time is recorded as TIMEOUT.
 
 Exit status: 0 when every difference is listed in the allow file, every
-difference the allow file lists actually occurred, every listed difference
-whose entry names the candidate's expected answer got that answer, and the
+difference the allow file lists actually occurred, the candidate gave the
+answer each listed difference's entry pins (an entry that pins nothing, or
+only the status of a 200 with a body, needs an "unpinned_reason"), and the
 candidate never crashed or timed out; 1 otherwise. A candidate crash fails the
 run even where the baseline crashes too, because two crashes compare as equal,
 and a listed difference that did not occur means the candidate behaves like
@@ -560,6 +561,28 @@ def phase(servers, fn):
     return res
 
 
+def pin_matches(want, got):
+    """want holds any of status, len, sha256, text (exact) and text_prefix."""
+    if not isinstance(want, dict):
+        return False
+    for key, val in want.items():
+        if key == "text_prefix":
+            if not (got.get("text") or "").startswith(val):
+                return False
+        elif got.get(key) != val:
+            return False
+    return True
+
+
+def unpinned(want, got):
+    """An expected answer that accepts too much: none at all, or a status
+    alone on a 200 that has a body."""
+    if not want:
+        return True
+    return (isinstance(want, dict) and set(want) == {"status"} and want["status"] == 200
+            and bool(got.get("len")))
+
+
 def compare(a, b, allow):
     diffs = []
     for k in sorted(set(a) | set(b)):
@@ -670,17 +693,23 @@ def main():
     seen = {d["id"] for d in report["diffs"]}
     not_seen = sorted(k for k in allow if k not in seen)
     report["expected_not_seen"] = not_seen
-    # A listed difference must also be the one intended: where the entry
-    # names the candidate's answer ("expect"), the candidate must give it.
-    # "unchanged" means a file equal to the dataset as built.
-    mismatched, not_pinned = [], []
+    # A listed difference must also be the one intended: the entry names the
+    # candidate's answer ("expect") and the candidate must give it.
+    # "unchanged" means a file equal to the dataset as built. An entry whose
+    # expect accepts too much (unpinned()) fails the run unless it says why
+    # in "unpinned_reason". "expect_baseline", where present, pins the
+    # baseline's answer the same way, e.g. to show the case reaches the crash.
+    mismatched, not_pinned, unpinned_fail = [], [], []
     for d in report["diffs"]:
         entry = allow.get(d["id"])
         if entry is None:
             continue
         want, got = entry.get("expect"), d["candidate"] or {}
-        if want is None:
-            not_pinned.append(d["id"])
+        bwant = entry.get("expect_baseline")
+        if bwant is not None and not pin_matches(bwant, d["baseline"] or {}):
+            mismatched.append({"id": d["id"], "role": "baseline", "expected": bwant, "got": d["baseline"]})
+        if unpinned(want, got):
+            (not_pinned if entry.get("unpinned_reason") else unpinned_fail).append(d["id"])
             continue
         if want == "unchanged":
             path = d["id"][len("disk "):]
@@ -689,11 +718,12 @@ def main():
                 ref = file_sha(os.path.join(work, "fixtures", path))
             ok = d["stage"] == "disk" and ref is not None and got.get("sha256") == ref
         else:
-            ok = all(got.get(key) == val for key, val in want.items())
+            ok = pin_matches(want, got)
         if not ok:
-            mismatched.append({"id": d["id"], "expected": want, "candidate": got})
+            mismatched.append({"id": d["id"], "role": "candidate", "expected": want, "got": got})
     report["expected_value_mismatch"] = mismatched
     report["not_pinned"] = not_pinned
+    report["unpinned"] = unpinned_fail
     if args.report:
         with open(args.report, "w") as f:
             json.dump(report, f, indent=1)
@@ -707,14 +737,17 @@ def main():
     for k in not_seen:
         print(f"[EXPECTED, NOT SEEN] {k}\n    {allow[k]['reason']}")
     for m in mismatched:
-        print(f"[WRONG CANDIDATE ANSWER] {m['id']}\n    expected:  {m['expected']}\n    candidate: {m['candidate']}")
+        print(f"[WRONG {m['role'].upper()} ANSWER] {m['id']}\n    expected:  {m['expected']}\n    {m['role']}: {m['got']}")
     for k in not_pinned:
-        print(f"[ALLOWED WITHOUT AN EXPECTED ANSWER] {k}")
+        print(f"[ALLOWED WITHOUT AN EXPECTED ANSWER] {k}\n    {allow[k]['unpinned_reason']}")
+    for k in unpinned_fail:
+        print(f"[UNPINNED] {k}\n    expect: {allow[k].get('expect')!r} (give the full answer, or say why not in unpinned_reason)")
     print(f"RESULT: {len(report['diffs'])} differences, {len(unexpected)} unexpected, "
           f"{len(report['crashes'])} crashes, {len(report['timeouts'])} timeouts "
           f"(baseline and candidate counted separately); candidate crashed or timed out {len(candidate_failures)} times; "
-          f"{len(not_seen)} expected differences not seen; {len(mismatched)} candidate answers not as expected")
-    return 1 if unexpected or candidate_failures or not_seen or mismatched else 0
+          f"{len(not_seen)} expected differences not seen; {len(mismatched)} answers not as expected; "
+          f"{len(unpinned_fail)} unpinned")
+    return 1 if unexpected or candidate_failures or not_seen or mismatched or unpinned_fail else 0
 
 
 if __name__ == "__main__":
