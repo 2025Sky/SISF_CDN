@@ -659,12 +659,16 @@ def pin_matches(want, got):
 
 
 def unpinned(want, got):
-    """An expected answer that accepts too much: none at all, or a status
-    alone on a 200 that has a body."""
+    """An expected answer that accepts too much: none at all, or one that
+    does not pin the body of an answer that has one (a status, or a status
+    and a length, without sha256, text or text_prefix)."""
     if not want:
         return True
-    return (isinstance(want, dict) and set(want) == {"status"} and want["status"] == 200
-            and bool(got.get("len")))
+    if not isinstance(want, dict):
+        return False
+    body_pins = {"sha256", "text", "text_prefix"}
+    has_body = bool(got.get("len"))
+    return has_body and not (set(want) & body_pins)
 
 
 def compare(a, b, allow):
