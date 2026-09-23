@@ -82,6 +82,9 @@ struct global_chunk_line
     size_t mchunk;
     size_t chunk;
     uint16_t *ptr;
+    // Extent the buffer was decoded with. A reload can change a chunk's
+    // extent, so a line for another extent is a miss.
+    size_t sizex, sizey, sizez;
 };
 
 enum ArchiveType
@@ -139,6 +142,7 @@ log_limiter log_limit_write_oom;
 log_limiter log_limit_append;
 log_limiter log_limit_header;
 log_limiter log_limit_read_outside;
+log_limiter log_limit_stale_extent;
 log_limiter log_limit_read_refused;
 log_limiter log_limit_write_refused;
 log_limiter log_limit_write_failed;
@@ -542,7 +546,10 @@ public:
             {
                 if (global_chunk_cache[i].chunk == id)
                 {
-                    if (global_chunk_cache[i].mchunk == this_mchunk_id)
+                    if (global_chunk_cache[i].mchunk == this_mchunk_id &&
+                        global_chunk_cache[i].sizex == sizex &&
+                        global_chunk_cache[i].sizey == sizey &&
+                        global_chunk_cache[i].sizez == sizez)
                     {
                         from_cache = global_chunk_cache[i].ptr;
                         break;
@@ -725,6 +732,9 @@ public:
                 cache_line->chunk = (size_t)id;
                 cache_line->mchunk = (size_t)this_mchunk_id;
                 cache_line->ptr = (uint16_t *)read_decomp_buffer;
+                cache_line->sizex = sizex;
+                cache_line->sizey = sizey;
+                cache_line->sizez = sizez;
 
                 global_chunk_cache_last++;
                 if (global_chunk_cache_last == global_cache_size)
@@ -904,6 +914,21 @@ public:
 
     descriptor_layer()
     {
+    }
+};
+
+// A chunk decoded for one request, with the extent it was decoded with. A
+// reload in the middle of a request can change the extent of the chunk a key
+// names, and a buffer must only ever be indexed with its own extent.
+struct region_chunk
+{
+    uint16_t *ptr = nullptr;
+    size_t xmin = 0, ymin = 0, zmin = 0;
+    size_t xsize = 0, ysize = 0, zsize = 0;
+
+    bool has_extent(size_t x0, size_t y0, size_t z0, size_t sx, size_t sy, size_t sz) const
+    {
+        return xmin == x0 && ymin == y0 && zmin == z0 && xsize == sx && ysize == sy && zsize == sz;
     }
 };
 
@@ -1530,7 +1555,7 @@ public:
         if (type == SISF)
         {
             // Define map for storing already decompressed chunks
-            std::map<std::tuple<size_t, size_t, size_t, size_t, size_t>, uint16_t *> chunk_cache;
+            std::map<std::tuple<size_t, size_t, size_t, size_t, size_t>, region_chunk> chunk_cache;
             std::set<std::tuple<size_t, size_t, size_t, size_t, size_t>> back_mchunks;
 
             // Scaled metachunk size — clamp to >=1
@@ -1552,6 +1577,8 @@ public:
 
             // Voxels that fall outside their stored tile read as 0
             size_t outside_voxels = 0;
+            // Voxels moved outside their chunk by a reload during this request read as 0
+            size_t stale_voxels = 0;
 
             for (size_t c = 0; c < channel_count; c++)
             {
@@ -1688,12 +1715,19 @@ public:
                                 }
 
                                 // Check if the chunk is in the tmp cache
-                                chunk = chunk_cache[*chunk_identifier];
-                                if (chunk == 0)
+                                region_chunk &cached = chunk_cache[*chunk_identifier];
+                                if (cached.ptr != nullptr && !cached.has_extent(cxmin, cymin, czmin, cxsize, cysize, czsize))
                                 {
-                                    chunk = chunk_reader->load_chunk(sub_chunk_id, cxsize, cysize, czsize, failed);
-                                    chunk_cache[*chunk_identifier] = chunk;
+                                    // Decoded before a reload in this request changed its extent
+                                    free(cached.ptr);
+                                    cached.ptr = nullptr;
                                 }
+                                if (cached.ptr == nullptr)
+                                {
+                                    cached = region_chunk{chunk_reader->load_chunk(sub_chunk_id, cxsize, cysize, czsize, failed),
+                                                          cxmin, cymin, czmin, cxsize, cysize, czsize};
+                                }
+                                chunk = cached.ptr;
 
                                 // Store this ID as the most recent chunk
                                 last_sub = sub_chunk_id;
@@ -1703,6 +1737,17 @@ public:
                             if (chunk == nullptr)
                             {
                                 // Out of memory in load_chunk; read as 0
+                                continue;
+                            }
+
+                            // The chunk was sized before a reload moved this voxel outside it
+                            if (x_in_chunk_offset - cxmin >= cxsize ||
+                                y_in_chunk_offset - cymin >= cysize ||
+                                z_in_chunk_offset - czmin >= czsize)
+                            {
+                                stale_voxels++;
+                                if (failed != nullptr)
+                                    *failed = true;
                                 continue;
                             }
 
@@ -1729,7 +1774,7 @@ public:
 
             for (auto it = chunk_cache.begin(); it != chunk_cache.end(); it++)
             {
-                free(it->second);
+                free(it->second.ptr);
             }
 
             std::string note;
@@ -1741,6 +1786,13 @@ public:
                               << " scale " << scale << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze
                               << " (archive geometry may be stale)" << note << std::endl;
                 }
+            }
+
+            if (stale_voxels > 0 && log_limit_stale_extent.allow(note))
+            {
+                std::cerr << "Chunk extent changed during a read: " << stale_voxels << " voxels read as 0 in " << fname
+                          << " scale " << scale << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze
+                          << note << std::endl;
             }
 
             if (failed != nullptr && *failed && log_limit_read_refused.allow(note))
@@ -1936,8 +1988,7 @@ public:
         const size_t buffer_size = osizex * osizey * osizez * sizeof(uint16_t) * channel_count;
 
         // Define map for storing already decompressed chunks
-        std::map<std::tuple<size_t, size_t, size_t, size_t, size_t>, uint16_t *> chunk_cache;
-        std::map<uint16_t *, std::tuple<size_t, size_t, size_t>> chunk_sizes;
+        std::map<std::tuple<size_t, size_t, size_t, size_t, size_t>, region_chunk> chunk_cache;
 
         // Scaled metachunk size — clamp to >=1 so a thin axis (e.g.
         // z=1 with no Z pyramid) doesn't divide by zero further down.
@@ -1968,7 +2019,7 @@ public:
             }
             for (auto it = chunk_cache.begin(); it != chunk_cache.end(); it++)
             {
-                free(it->second);
+                free(it->second.ptr);
             }
             if (chunk_identifier != nullptr)
             {
@@ -2075,8 +2126,12 @@ public:
                             }
 
                             // Check if the chunk is in the tmp cache
-                            chunk = chunk_cache[*chunk_identifier];
-                            if (chunk == 0)
+                            region_chunk &cached = chunk_cache[*chunk_identifier];
+                            if (cached.ptr != nullptr && !cached.has_extent(cxmin, cymin, czmin, cxsize, cysize, czsize))
+                            {
+                                return reject("Chunk extent changed during the write", chunk_reader->meta_fname);
+                            }
+                            if (cached.ptr == nullptr)
                             {
                                 // Writing back a chunk that failed to load would replace its
                                 // voxels outside this region with zeros
@@ -2087,14 +2142,21 @@ public:
                                     free(chunk);
                                     return reject("Could not read existing chunk", chunk_reader->data_fname + " chunk " + std::to_string(sub_chunk_id));
                                 }
-                                chunk_cache[*chunk_identifier] = chunk;
-
-                                chunk_sizes[chunk] = std::make_tuple(cxsize, cysize, czsize);
+                                cached = region_chunk{chunk, cxmin, cymin, czmin, cxsize, cysize, czsize};
                             }
+                            chunk = cached.ptr;
 
                             // Store this ID as the most recent chunk
                             last_sub = sub_chunk_id;
                             last_c = c;
+                        }
+
+                        // The chunk was sized before a reload moved this voxel outside it
+                        if (x_in_chunk_offset - cxmin >= cxsize ||
+                            y_in_chunk_offset - cymin >= cysize ||
+                            z_in_chunk_offset - czmin >= czsize)
+                        {
+                            return reject("Chunk extent changed during the write", chunk_reader->meta_fname);
                         }
 
                         // Calculate the coordinates of the input and output inside their respective buffers
@@ -2133,17 +2195,17 @@ public:
             if (chunk_writer == nullptr)
             {
                 all_written = false;
-                free(it->second);
+                free(it->second.ptr);
                 continue;
             }
 
-            size_t chunk_size = std::get<0>(chunk_sizes[it->second]) * std::get<1>(chunk_sizes[it->second]) * std::get<2>(chunk_sizes[it->second]) * sizeof(uint16_t);
+            size_t chunk_size = it->second.xsize * it->second.ysize * it->second.zsize * sizeof(uint16_t);
 
-            if (!chunk_writer->overwrite_chunk(std::get<4>(id_tuple), it->second, chunk_size))
+            if (!chunk_writer->overwrite_chunk(std::get<4>(id_tuple), it->second.ptr, chunk_size))
             {
                 all_written = false;
             }
-            free(it->second);
+            free(it->second.ptr);
         }
 
         if (!all_written)
