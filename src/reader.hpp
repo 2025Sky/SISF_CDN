@@ -23,6 +23,7 @@ Licensed under the terms specified in LICENSE.md
 #include <queue>
 #include <deque>
 #include <mutex>
+#include <atomic>
 #include <map>
 #include <chrono>
 
@@ -99,6 +100,46 @@ std::timed_mutex global_chunk_cache_mutex;
 size_t global_cache_size = 100;
 global_chunk_line *global_chunk_cache = (global_chunk_line *)calloc(global_cache_size, sizeof(global_chunk_line));
 size_t global_chunk_cache_last = 0;
+
+// The log lines this fork adds are rate limited: at most one line per second
+// per kind, and the next line that gets through says how many were dropped
+// in between. A failure that persists (a corrupt chunk, a stale dataset) is
+// hit on every request and would otherwise fill the log. Atomics only, so
+// logging never waits on a lock.
+class log_limiter
+{
+    std::atomic<int64_t> next_ms{0};
+    std::atomic<uint64_t> dropped{0};
+
+public:
+    // True when the caller may write its line now; note is then empty or
+    // names how many lines of this kind were dropped since the last one.
+    bool allow(std::string &note)
+    {
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+        int64_t next = next_ms.load(std::memory_order_relaxed);
+        if (now_ms < next || !next_ms.compare_exchange_strong(next, now_ms + 1000, std::memory_order_relaxed))
+        {
+            dropped.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+
+        const uint64_t n = dropped.exchange(0, std::memory_order_relaxed);
+        note = n == 0 ? "" : " (" + std::to_string(n) + " similar lines suppressed)";
+        return true;
+    }
+};
+
+log_limiter log_limit_chunk_oom;
+log_limiter log_limit_chunk_decode;
+log_limiter log_limit_entry_write;
+log_limiter log_limit_write_oom;
+log_limiter log_limit_append;
+log_limiter log_limit_read_outside;
+log_limiter log_limit_write_refused;
+log_limiter log_limit_write_failed;
 
 // https://stackoverflow.com/questions/8401777/simple-glob-in-c-on-unix-system
 std::vector<std::string> glob_tool(const std::string &pattern)
@@ -401,7 +442,11 @@ public:
 
             if (file.fail())
             {
-                std::cerr << "Metadata entry write failed: " << meta_fname << " chunk " << id << std::endl;
+                std::string note;
+                if (log_limit_entry_write.allow(note))
+                {
+                    std::cerr << "Metadata entry write failed: " << meta_fname << " chunk " << id << note << std::endl;
+                }
                 return false;
             }
             return true;
@@ -422,7 +467,11 @@ public:
         uint16_t *out = (uint16_t *)calloc(out_buffer_size, 1);
         if (out == NULL)
         {
-            std::cerr << "Chunk read failed (out of memory): " << data_fname << " chunk " << id << std::endl;
+            std::string note;
+            if (log_limit_chunk_oom.allow(note))
+            {
+                std::cerr << "Chunk read failed (out of memory): " << data_fname << " chunk " << id << note << std::endl;
+            }
             if (failed != nullptr)
                 *failed = true;
             return NULL;
@@ -474,7 +523,11 @@ public:
             uint16_t *read_buffer = (uint16_t *)malloc(buffer_size);
             if (read_buffer == NULL)
             {
-                std::cerr << "Chunk read failed (out of memory): " << data_fname << " chunk " << id << std::endl;
+                std::string note;
+                if (log_limit_chunk_oom.allow(note))
+                {
+                    std::cerr << "Chunk read failed (out of memory): " << data_fname << " chunk " << id << note << std::endl;
+                }
                 if (failed != nullptr)
                     *failed = true;
                 free(sel);
@@ -598,8 +651,13 @@ public:
 
             if (decode_error != NULL)
             {
-                std::cerr << "Chunk decode failed (" << decode_error << "): " << data_fname << " chunk " << id
-                          << " compression " << compression_type << " decoded " << decomp_size << " expected " << out_buffer_size << std::endl;
+                std::string note;
+                if (log_limit_chunk_decode.allow(note))
+                {
+                    std::cerr << "Chunk decode failed (" << decode_error << "): " << data_fname << " chunk " << id
+                              << " compression " << compression_type << " decoded " << decomp_size << " expected " << out_buffer_size
+                              << note << std::endl;
+                }
                 if (failed != nullptr)
                     *failed = true;
                 free(read_decomp_buffer);
@@ -650,7 +708,11 @@ public:
         void *compressed_data = malloc(compressed_size);
         if (compressed_data == NULL)
         {
-            std::cerr << "Chunk write failed (out of memory): " << data_fname << " chunk " << id << std::endl;
+            std::string note;
+            if (log_limit_write_oom.allow(note))
+            {
+                std::cerr << "Chunk write failed (out of memory): " << data_fname << " chunk " << id << note << std::endl;
+            }
             return false;
         }
 
@@ -685,7 +747,11 @@ public:
             // Never point the entry at bytes that did not reach the file
             if (new_offset == (size_t)-1 || file.fail())
             {
-                std::cerr << "Chunk append failed: " << data_fname << " chunk " << id << std::endl;
+                std::string note;
+                if (log_limit_append.allow(note))
+                {
+                    std::cerr << "Chunk append failed: " << data_fname << " chunk " << id << note << std::endl;
+                }
                 free(compressed_data);
                 return false;
             }
@@ -1598,11 +1664,15 @@ public:
                 free(it->second);
             }
 
+            std::string note;
             if (outside_voxels > 0)
             {
-                std::cerr << "Read outside stored tiles: " << outside_voxels << " voxels read as 0 in " << fname
-                          << " scale " << scale << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze
-                          << " (archive geometry may be stale)" << std::endl;
+                if (log_limit_read_outside.allow(note))
+                {
+                    std::cerr << "Read outside stored tiles: " << outside_voxels << " voxels read as 0 in " << fname
+                              << " scale " << scale << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze
+                              << " (archive geometry may be stale)" << note << std::endl;
+                }
             }
         }
         else if (type == ZARR)
@@ -1815,8 +1885,12 @@ public:
         // Nothing has been written when this runs: the first loop edits copies only
         auto reject = [&](const char *reason, const std::string &where) -> bool
         {
-            std::cerr << "Write refused (" << reason << "): " << fname << ' ' << where
-                      << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze << std::endl;
+            std::string note;
+            if (log_limit_write_refused.allow(note))
+            {
+                std::cerr << "Write refused (" << reason << "): " << fname << ' ' << where
+                          << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze << note << std::endl;
+            }
             for (auto it = chunk_cache.begin(); it != chunk_cache.end(); it++)
             {
                 free(it->second);
@@ -1995,7 +2069,11 @@ public:
         if (!all_written)
         {
             // The other chunks of the request may have been written
-            std::cerr << "Write failed: " << fname << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze << std::endl;
+            std::string note;
+            if (log_limit_write_failed.allow(note))
+            {
+                std::cerr << "Write failed: " << fname << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze << note << std::endl;
+            }
             error = "Could not write chunk";
         }
         return all_written;
