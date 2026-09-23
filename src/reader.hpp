@@ -142,6 +142,7 @@ log_limiter log_limit_write_oom;
 log_limiter log_limit_append;
 log_limiter log_limit_header;
 log_limiter log_limit_read_outside;
+log_limiter log_limit_stale_archive;
 log_limiter log_limit_stale_extent;
 log_limiter log_limit_read_refused;
 log_limiter log_limit_write_refused;
@@ -196,6 +197,18 @@ time_t get_file_mtime(std::string filename)
     if (stat(filename.c_str(), &result) == 0)
     {
         return result.st_mtime;
+    }
+    return 0;
+}
+
+// Modification time in nanoseconds, 0 if the file does not exist. A
+// re-conversion can rewrite a file within the second it was first read.
+int64_t get_file_mtime_ns(const std::string &filename)
+{
+    struct stat result;
+    if (stat(filename.c_str(), &result) == 0)
+    {
+        return (int64_t)result.st_mtim.tv_sec * 1000000000 + result.st_mtim.tv_nsec;
     }
     return 0;
 }
@@ -958,6 +971,11 @@ public:
 
     ArchiveType type;
 
+    // The archive geometry is read once per process. Its file and mtime at
+    // that point let a read outside the stored tiles say whether it is stale.
+    std::string metadata_fname;
+    int64_t metadata_mtime_ns = 0;
+
     std::unordered_map<std::string, archive_reader *> *parent_archive_inventory;
 
     archive_reader(std::string name_in, enum ArchiveType type_in, std::unordered_map<std::string, archive_reader *> *par_in = nullptr)
@@ -1157,6 +1175,9 @@ public:
 
     void load_metadata_sisf()
     {
+        metadata_fname = fname + (metadata_json ? "/metadata.json" : "/metadata.bin");
+        metadata_mtime_ns = get_file_mtime_ns(metadata_fname);
+
         if (metadata_json)
         {
             std::ifstream inputFile(fname + "/metadata.json");
@@ -1785,6 +1806,13 @@ public:
                     std::cerr << "Read outside stored tiles: " << outside_voxels << " voxels read as 0 in " << fname
                               << " scale " << scale << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze
                               << " (archive geometry may be stale)" << note << std::endl;
+                }
+
+                // This process keeps the tile step and size it read at startup; only a restart reads them again
+                if (get_file_mtime_ns(metadata_fname) != metadata_mtime_ns && log_limit_stale_archive.allow(note))
+                {
+                    std::cerr << "Archive geometry is stale: " << metadata_fname << " changed on disk after it was loaded; "
+                              << "restart the CDN to serve the new geometry of " << fname << note << std::endl;
                 }
             }
 
