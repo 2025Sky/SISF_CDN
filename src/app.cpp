@@ -1886,60 +1886,91 @@ int main(int argc, char *argv[])
 			return;
 		}
 
-		uint16_t * chunk = nullptr;
+		region_chunk * chunk = nullptr;
 		size_t last_sub_chunk_id = SIZE_MAX;
 
-		std::map<size_t, uint16_t *> chunk_cache;
+		std::map<size_t, region_chunk> chunk_cache;
+
+		// Voxels a reload during this request left outside the stored tile, or
+		// in an mchunk whose header became unusable, read as 0
+		size_t stale_voxels = 0;
 
 		for (size_t i = x_begin; i < x_end; i++)
 		{
-			// Find the start/stop coordinates of this chunk
-			const size_t xmin = mchunkx * (i / mchunkx);			  // lower bound of mchunk
-			const size_t xmax = std::min((size_t)xmin + mchunkx, sx); // upper bound of mchunk
-			const size_t xsize = xmax - xmin;
-
 			for (size_t j = y_begin; j < y_end; j++)
 			{
-				const size_t ymin = mchunky * (j / mchunky);
-				const size_t ymax = std::min(ymin + mchunky, sy);
-				const size_t ysize = ymax - ymin;
-
 				for (size_t k = z_begin; k < z_end; k++)
 				{
-					const size_t zmin = mchunkz * (k / mchunkz);
-					const size_t zmax = std::min(zmin + mchunkz, sz);
+					const size_t ooffset = ((k - z_begin) * chunk_sizes[1] * chunk_sizes[0]) + // Z
+										   ((j - y_begin) * chunk_sizes[0]) +				   // Y
+										   (i - x_begin);									   // X
+
+					// load_chunk reloads the header when the .meta changed on disk, so the
+					// geometry is read again for every voxel (as load_region does), and a
+					// chunk buffer is only indexed with the extent it was loaded with
+					const size_t cx = chunk_reader->chunkx;
+					const size_t cy = chunk_reader->chunky;
+					const size_t cz = chunk_reader->chunkz;
+					const size_t csx = chunk_reader->sizex;
+					const size_t csy = chunk_reader->sizey;
+					const size_t csz = chunk_reader->sizez;
+
+					if (!chunk_reader->is_valid || cx == 0 || cy == 0 || cz == 0 || i >= csx || j >= csy || k >= csz)
+					{
+						stale_voxels++;
+						out_buffer[ooffset] = 0;
+						continue;
+					}
+
+					// Find the start/stop coordinates of this chunk
+					const size_t xmin = cx * (i / cx);			  // lower bound of mchunk
+					const size_t xmax = std::min(xmin + cx, csx); // upper bound of mchunk
+					const size_t xsize = xmax - xmin;
+
+					const size_t ymin = cy * (j / cy);
+					const size_t ymax = std::min(ymin + cy, csy);
+					const size_t ysize = ymax - ymin;
+
+					const size_t zmin = cz * (k / cz);
+					const size_t zmax = std::min(zmin + cz, csz);
 					const size_t zsize = zmax - zmin;
 
 					const size_t sub_chunk_id = chunk_reader->find_index(i, j, k);
 
-					if (sub_chunk_id != last_sub_chunk_id || chunk == nullptr)
+					if (sub_chunk_id != last_sub_chunk_id || chunk == nullptr ||
+						!chunk->has_extent(xmin, ymin, zmin, xsize, ysize, zsize))
 					{
-						chunk = chunk_cache[sub_chunk_id];
+						chunk = &chunk_cache[sub_chunk_id];
 
-						if (chunk == 0)
+						if (chunk->ptr != nullptr && !chunk->has_extent(xmin, ymin, zmin, xsize, ysize, zsize))
 						{
-							chunk = chunk_reader->load_chunk(sub_chunk_id, xsize, ysize, zsize);
-							chunk_cache[sub_chunk_id] = chunk;
+							// Loaded before a reload in this request changed its extent
+							free(chunk->ptr);
+							chunk->ptr = nullptr;
+						}
+
+						if (chunk->ptr == nullptr)
+						{
+							*chunk = region_chunk{chunk_reader->load_chunk(sub_chunk_id, xsize, ysize, zsize),
+												  xmin, ymin, zmin, xsize, ysize, zsize};
 						}
 
 						last_sub_chunk_id = sub_chunk_id;
 					}
 
-					const size_t x_in_chunk_offset = i - xmin;
-					const size_t y_in_chunk_offset = j - ymin;
-					const size_t z_in_chunk_offset = k - zmin;
+					// The buffer's own extent, which is this voxel's unless a reload inside
+					// the load_chunk just above changed the geometry
+					const size_t x_in_chunk_offset = i - chunk->xmin;
+					const size_t y_in_chunk_offset = j - chunk->ymin;
+					const size_t z_in_chunk_offset = k - chunk->zmin;
 
 					// Calculate the coordinates of the input and output inside their respective buffers
-					const size_t coffset = (x_in_chunk_offset * ysize * zsize) + // X
-										   (y_in_chunk_offset * zsize) +		 // Y
-										   (z_in_chunk_offset);					 // Z
-
-					const size_t ooffset = ((k - z_begin) * chunk_sizes[1] * chunk_sizes[0]) + // Z
-										   ((j - y_begin) * chunk_sizes[0]) +				   // Y
-										   (i - x_begin);									   // X
+					const size_t coffset = (x_in_chunk_offset * chunk->ysize * chunk->zsize) + // X
+										   (y_in_chunk_offset * chunk->zsize) +				   // Y
+										   (z_in_chunk_offset);								   // Z
 
 					// A NULL chunk (out of memory) reads as 0
-					const uint16_t v = chunk == nullptr ? 0 : chunk[coffset];
+					const uint16_t v = chunk->ptr == nullptr ? 0 : chunk->ptr[coffset];
 					out_buffer[ooffset] = v;
 				}
 			}
@@ -1947,8 +1978,18 @@ int main(int argc, char *argv[])
 
 		for (auto it = chunk_cache.begin(); it != chunk_cache.end(); it++)
         {
-            free(it->second);
+            free(it->second.ptr);
         }
+
+		if (stale_voxels > 0)
+		{
+			std::string note;
+			if (log_limit_stale_extent.allow(note))
+			{
+				std::cerr << "Chunk extent changed during a raw_access read: " << stale_voxels << " voxels read as 0 in "
+						  << chunk_reader->meta_fname << note << std::endl;
+			}
+		}
 
 		for(const auto& pair : filters) {
 			filter_run(
