@@ -1,0 +1,83 @@
+name: cai-build-and-regress
+
+# Builds the CDN image natively on amd64 (the architecture production runs) and
+# compares it against the production image with the black-box harness in
+# tests/regress. Nothing is published unless a run is started by hand with
+# publish=true.
+
+on:
+  push:
+    branches: [ "dev/**", "cai/**" ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push the image to ghcr.io after the harness passes"
+        type: boolean
+        default: false
+
+env:
+  # Production image, pinned by digest (tuffr5/sisf_cdn:latest as deployed).
+  BASELINE: tuffr5/sisf_cdn@sha256:83d43adc3df20c169cbafe21311551068c810326a774bdd25fbefa5a2026b875
+
+jobs:
+  build-and-regress:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Free disk space (build stage and baseline image need ~20 GB)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+
+      - name: Record the build CPU (the Makefile compiles with -march=native)
+        run: |
+          lscpu | grep -E 'Model name|Flags' | cut -c1-400
+          gcc -march=native -Q --help=target | grep -E '^\s+-march='
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build candidate image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: BUILD_THREAD=4
+          load: true
+          tags: sisf_cdn:candidate
+
+      - name: Pull baseline image
+        run: docker pull "$BASELINE"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Regression harness (candidate vs production)
+        working-directory: tests/regress
+        run: |
+          pip install numpy zstd
+          python harness.py --baseline "$BASELINE" --candidate sisf_cdn:candidate \
+            --work "$RUNNER_TEMP/regress" --allow expected_diffs.json --report "$RUNNER_TEMP/report.json"
+
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regress-report
+          path: ${{ runner.temp }}/report.json
+
+      - name: Publish to ghcr.io
+        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          img="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::12}"
+          docker tag sisf_cdn:candidate "$img"
+          docker push "$img"
+          docker inspect --format '{{index .RepoDigests 0}}' "$img"
