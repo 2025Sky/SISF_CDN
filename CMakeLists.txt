@@ -80,3 +80,8 @@ target_link_libraries(
 #  PRIVATE
     tensorstore::tensorstore tensorstore::all_drivers
 )
+
+# zlib for SEG_GZIP (app.cpp). Tensorstore already builds zlib and links it
+# into the server statically; linking its target gives app.cpp the headers
+# that match that copy, instead of the system's zlib.h over another version.
+target_link_libraries(nTracer_cdn ZLIB::ZLIB)

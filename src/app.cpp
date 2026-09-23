@@ -39,6 +39,10 @@ Licensed under the terms specified in LICENSE.md
 #include <tuple>
 #include <vector>
 
+#include <climits>
+// The zlib tensorstore builds and links into the server (CMakeLists.txt)
+#include <zlib.h>
+
 #include "counter.hpp"
 
 int port = 100;
@@ -70,6 +74,140 @@ std::string read_too_large(size_t x, size_t y, size_t z)
 	return "400 Bad Request -- Read too large: " + std::to_string(x) + "x" + std::to_string(y) + "x" + std::to_string(z) +
 		   " voxels is more than the limit of " + std::to_string(MAX_READ_VOXELS) +
 		   " voxels per channel; read a smaller box\n";
+}
+
+// SEG_GZIP: the zlib level, 1 (fastest) to 9 (smallest), at which the image
+// route sends a successful read of a writable (protected) layer gzip-encoded
+// to a client whose Accept-Encoding accepts gzip. Writable layers hold
+// segmentation labels, which compress well; images compress poorly and are
+// never compressed, nor is any other route or any error. Unset or 0 (the
+// default) compresses nothing; any other value is ignored with a log line.
+int SEG_GZIP_LEVEL = 0;
+
+// A body shorter than this is sent as it is: it fits in one packet either
+// way, and a compressor costs about 256 KiB of zlib state to set up.
+const size_t SEG_GZIP_MIN_BYTES = 1024;
+
+log_limiter log_limit_gzip_failed;
+
+// A header item with the spaces and tabs around it removed, in lower case
+std::string trim_lower(const std::string &s)
+{
+	const size_t b = s.find_first_not_of(" \t");
+	if (b == std::string::npos)
+	{
+		return "";
+	}
+	std::string out = s.substr(b, s.find_last_not_of(" \t") - b + 1);
+	std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c)
+				   { return std::tolower(c); });
+	return out;
+}
+
+// Whether an Accept-Encoding value accepts gzip: its first "gzip" coding (any
+// case), unless that coding's q value is 0 or is not a valid q value (0 to 1,
+// at most three decimals). "*" and "x-gzip" are not taken as gzip; a client
+// that sends only those gets the body uncompressed, which every client takes.
+bool accepts_gzip(const std::string &accept_encoding)
+{
+	for (const std::string &item : str_split(accept_encoding, ','))
+	{
+		const std::vector<std::string> parts = str_split(item, ';');
+		if (parts.empty() || trim_lower(parts[0]) != "gzip")
+		{
+			continue;
+		}
+		for (size_t i = 1; i < parts.size(); i++)
+		{
+			const std::string param = trim_lower(parts[i]);
+			if (param.rfind("q=", 0) != 0)
+			{
+				continue;
+			}
+			const std::string q = param.substr(2);
+			if (q.empty() || (q[0] != '0' && q[0] != '1') || q.size() > 5 || (q.size() > 1 && q[1] != '.'))
+			{
+				return false;
+			}
+			bool zero_decimals = true;
+			for (size_t k = 2; k < q.size(); k++)
+			{
+				if (q[k] < '0' || q[k] > '9')
+				{
+					return false;
+				}
+				zero_decimals &= q[k] == '0';
+			}
+			// "1.5" is not a q value; "0", "0.", "0.000" refuse gzip
+			return q[0] == '1' ? zero_decimals : !zero_decimals;
+		}
+		return true;
+	}
+	return false;
+}
+
+// Replaces res.body with its gzip encoding and sets Content-Encoding and
+// Vary, when SEG_GZIP is on, the request accepts gzip, the body is at least
+// SEG_GZIP_MIN_BYTES long and its encoding is shorter than the body.
+// Otherwise the body is left as it is, and so it is when zlib fails (logged):
+// an uncompressed answer is always a correct one. A body over 4 GiB is also
+// sent as it is, since zlib takes at most that much in one call.
+void gzip_body(const crow::request &req, crow::response &res)
+{
+	const size_t in_size = res.body.size();
+	if (SEG_GZIP_LEVEL == 0 || in_size < SEG_GZIP_MIN_BYTES || in_size > UINT_MAX ||
+		!accepts_gzip(req.get_header_value("Accept-Encoding")))
+	{
+		return;
+	}
+
+	// Room for an encoding one byte shorter than the body. malloc does not
+	// touch the pages, so a body that compresses well costs about its
+	// encoded size in memory, not its own size.
+	const size_t cap = in_size - 1;
+	char *out = (char *)malloc(cap);
+	z_stream zs = {};
+	int rc = Z_MEM_ERROR;
+	if (out != NULL)
+	{
+		// 15 + 16: a 32 KiB window, with the gzip header and trailer
+		rc = deflateInit2(&zs, SEG_GZIP_LEVEL, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY);
+	}
+	if (rc != Z_OK)
+	{
+		free(out);
+		std::string note;
+		if (log_limit_gzip_failed.allow(note))
+		{
+			std::cerr << "Gzip failed to start (zlib " << rc << "); sending the read uncompressed" << note << std::endl;
+		}
+		return;
+	}
+
+	zs.next_in = (Bytef *)res.body.data();
+	zs.avail_in = (uInt)in_size;
+	zs.next_out = (Bytef *)out;
+	zs.avail_out = (uInt)cap;
+	// Z_STREAM_END: the whole encoding fitted. Z_OK or Z_BUF_ERROR: it did
+	// not, so it is not shorter than the body. Anything else is a failure.
+	rc = deflate(&zs, Z_FINISH);
+	const size_t out_size = zs.total_out;
+	deflateEnd(&zs);
+	if (rc == Z_STREAM_END)
+	{
+		res.body.assign(out, out_size);
+		res.set_header("Content-Encoding", "gzip");
+		res.set_header("Vary", "Accept-Encoding");
+	}
+	else if (rc != Z_OK && rc != Z_BUF_ERROR)
+	{
+		std::string note;
+		if (log_limit_gzip_failed.allow(note))
+		{
+			std::cerr << "Gzip failed (zlib " << rc << "); sending the read uncompressed" << note << std::endl;
+		}
+	}
+	free(out);
 }
 
 // How many items of a data id's filter list (the text after its first '+',
@@ -329,6 +467,15 @@ int main(int argc, char *argv[])
 		MAX_READ_VOXELS = 0;
 		std::cerr << "MAX_READ_VOXELS ignored (not a whole number): " << max_read_voxels << std::endl;
 	}
+
+	std::string seg_gzip = read_env_variable("SEG_GZIP");
+	size_t seg_gzip_level = 0;
+	if (seg_gzip.size() > 0 && (!parse_decimal(seg_gzip, seg_gzip_level) || seg_gzip_level > 9))
+	{
+		seg_gzip_level = 0;
+		std::cerr << "SEG_GZIP ignored (not a level from 0 to 9): " << seg_gzip << std::endl;
+	}
+	SEG_GZIP_LEVEL = (int)seg_gzip_level;
 
 	std::string thread_count = read_env_variable("THREAD_COUNT");
 	if (thread_count.size() > 0)
@@ -2289,7 +2436,7 @@ int main(int argc, char *argv[])
 	// @app.route("/data/<data_id>/<resolution>/<key>-<key>-<key>")
 	// This has to be last in the route list because it acts as a wildcard
 	CROW_ROUTE(app, "/<string>/<string>/<string>")
-	([](crow::response &res, std::string data_id_in, std::string resolution_id, std::string tile_key)
+	([](const crow::request &req, crow::response &res, std::string data_id_in, std::string resolution_id, std::string tile_key)
 	 {
 		auto begin = now();
 		
@@ -2696,6 +2843,12 @@ int main(int argc, char *argv[])
 		res.body = std::string((char *) out_buffer, out_buffer_size);
 		free(out_buffer);
 
+		// Only a writable layer's read, which holds labels (see SEG_GZIP)
+		if (reader->is_protected)
+		{
+			gzip_body(req, res);
+		}
+
 		res.end(); 
 		
 		log_time(data_id, "READ", scale, x_end-x_begin, y_end-y_begin, z_end-z_begin, begin); });
@@ -2705,6 +2858,7 @@ int main(int argc, char *argv[])
 		std::cout << "Thread count: " << THREAD_COUNT << std::endl;
 		std::cout << "Chunk cache lines: " << global_cache_size << std::endl;
 		std::cout << "Read limit (voxels per channel): " << (MAX_READ_VOXELS > 0 ? std::to_string(MAX_READ_VOXELS) : "none") << std::endl;
+		std::cout << "Gzip for writable layers: " << (SEG_GZIP_LEVEL > 0 ? "level " + std::to_string(SEG_GZIP_LEVEL) : "off") << std::endl;
 
 		app.port(port)
 			//.use_compression(crow::compression::algorithm::DEFLATE)

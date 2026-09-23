@@ -136,12 +136,13 @@ In testing, a complete build of the applet can be completed in around 5-10 minut
 
 To run the `SISF_CDN`, very little system resources are required at a minimum. If you are running the software on a system with a small number of CPU cores, the number of worker threads can be reduced using the `THREAD_COUNT` environment variable.
 
-Two more environment variables size the server:
+Three more environment variables size the server or change what it sends:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `CHUNK_CACHE_LINES` | `100` | How many decoded chunks the server keeps in memory for reuse. Each holds one chunk (64 KiB for a 32x32x32 `uint16` chunk). A value that is not a whole number from 1 to 1000000 is ignored with a log line. |
 | `MAX_READ_VOXELS` | `0` (no limit) | The most voxels one read may cover, per channel: a larger box answers `400` on the image route, `tracing` (the box it reads around its two points) and `raw_access`, whatever the dataset's channel count, and `channel=<n>` does not allow a larger box. A projection counts the box it reads, not the one it returns. A value that is not a whole number is ignored with a log line. |
+| `SEG_GZIP` | `0` (off) | The zlib level, `1` (fastest) to `9` (smallest), at which a successful image read of a writable layer (one with a `.sisf_access` file, which holds segmentation labels) is sent with `Content-Encoding: gzip` and `Vary: Accept-Encoding` to a client whose `Accept-Encoding` accepts `gzip`. Image layers, every other route, errors, clients that do not accept `gzip`, bodies under 1024 bytes and bodies that would not get shorter are sent uncompressed, and so is a read whose compression fails. A value that is not a level from 0 to 9 is ignored with a log line. |
 
 ## Sample Data
 
