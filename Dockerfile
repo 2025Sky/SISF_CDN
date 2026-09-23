@@ -1,6 +1,5 @@
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS build
 
-ARG CDN_PORT=6000
 ARG BUILD_THREAD=64
 
 RUN apt update && \
@@ -21,6 +20,27 @@ RUN cd ffmpeg_HDF5_filter; cmake .; make -j $BUILD_THREAD; cd ..
 RUN cmake .; exit 0
 RUN make -j $BUILD_THREAD
 
+# Runtime image: only the binary, the two in-tree shared libraries it loads
+# through its RUNPATH (/app/zstd/lib, /app/ffmpeg_HDF5_filter), and the distro
+# runtime libraries. curl is here so a health check can make a real request.
+FROM ubuntu:24.04
+
+ARG CDN_PORT=6000
+
+RUN apt update && \
+    apt install -y --no-install-recommends \
+        libsqlite3-0 libavcodec60 libavformat60 libavutil58 libswscale7 \
+        libhdf5-103-1t64 curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=build /app/nTracer_cdn /app/nTracer_cdn
+COPY --from=build /app/zstd/lib/libzstd.so* /app/zstd/lib/
+COPY --from=build /app/ffmpeg_HDF5_filter/libh5ffmpeg_shared.so /app/ffmpeg_HDF5_filter/
+
 EXPOSE ${CDN_PORT}
 
-CMD ["sh", "-c", "ls -lh /data/; ./nTracer_cdn 6000 /data/"]
+# exec replaces the shell, so the server is PID 1 and receives SIGTERM from
+# docker stop instead of being killed after the timeout.
+CMD ["sh", "-c", "ls -lh /data/; exec ./nTracer_cdn 6000 /data/"]
