@@ -74,7 +74,15 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
   - s14: a second server on the same data started with `MAX_READ_VOXELS`
     set: reads under, at and over the limit, a projection over it, a
     reversed box, one channel of a box that is over it with every channel,
-    and a server whose limit is not a number.
+    and a server whose limit is not a number;
+  - s15: an mchunk's `.meta` and `.data` replaced by rename (inside the
+    container) while a long read of it is under way, then read and PATCHed
+    after another read reloaded the header: the chunk the long read read
+    last, and the PATCH merged into it, must be the new files' (a request
+    that keeps its files open must not put the old files' chunks into the
+    cache). Every answer compared is the same wherever the rename lands;
+    whether it catches a broken build depends on it landing while the long
+    read is still reading (see `stress_d6.py --mode rename`).
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
@@ -96,14 +104,16 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
 environment variable, e.g. `CHUNK_CACHE_LINES=4096` to check that a larger
 chunk cache changes no answer.
 
-`stress_d6.py` is not part of the gate. It stresses the stale cache
-re-insert (a read that decoded a chunk while a PATCH replaced it putting
-the old chunk back into the cache), which sits between two points inside
-the server and cannot be triggered on demand from outside: reader
-processes read one chunk without pause while a writer PATCHes it, and
-after each PATCH the chunk is read again. A run that finds no stale read
-means something only if the same settings find some on a build without
-the fix.
+`stress_d6.py` is not part of the gate. It stresses stale chunks in the
+chunk cache, which sit between two points inside the server and cannot be
+triggered on demand from outside. `--mode patch`: a read that decoded a
+chunk while a PATCH replaced it putting the old chunk back into the cache;
+reader processes read one chunk without pause while a writer PATCHes it,
+and after each PATCH the chunk is read again. `--mode rename`: s15's
+sequence, repeated, reporting how many cycles landed. `--mode
+rename-write`: the files replaced at a later point in each cycle of a long
+PATCH, then every voxel checked. A run that finds no stale read means
+something only if the same settings find some on a build without the fix.
 
 Compare like with like: run both images on amd64. An integer division by zero
 that kills the process on x86-64 returns 0 on arm64, so an arm64 candidate can

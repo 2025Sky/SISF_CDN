@@ -1042,6 +1042,74 @@ def sc_skeleton_api_writes(server, results, sid):
             other.remove()
 
 
+def sc_replaced_during_read(server, results, sid):
+    """An mchunk's .meta and .data replaced by rename (as mv, or rsync
+    without --inplace, do), inside the container, while a long read of the
+    mchunk is under way; then one voxel is read (which reloads the header),
+    and after the long read ends the chunk it read last is read, one voxel
+    of that chunk is PATCHed (so the rest of it is merged) and the chunk is
+    read again. The fork's long read keeps reading the files it opened, so
+    none of what it reads after the reload may reach the chunk cache.
+    Production opens the files by name for every chunk. Every answer
+    compared here is the same wherever the rename lands in the long read,
+    for production and for a correct fork, so this case cannot fail
+    spuriously; how likely it is to catch a fork that lets old chunks into
+    the cache depends on the rename landing while the long read is still
+    reading (4^3 chunks make it slow: 262,144 of them).
+    stress_d6.py --mode rename measures that. The long read's own answer
+    depends on where the rename lands and is compared by status only.
+    Both versions are noise that zstd cannot compress, so every chunk is
+    stored at the same length and the two .meta files are the same bytes:
+    production, reading between the two renames, meets the new .data with
+    the old table and reads a whole chunk of one version or the other,
+    instead of a cut frame, which kills it (s2)."""
+    ds, size, c = "sc_rename", (512, 512, 64), 4
+    X, Y, Z = size
+    name = "chunk_0_0_0.0.1X"
+    root = os.path.join(server.data_dir, ds)
+    fixtures.write_metadata(root, 1, size, RES, size)
+    with open(os.path.join(root, ".sisf_access"), "w") as f:
+        f.write(fixtures.TOKEN + "\n")
+    old = np.random.default_rng(11).integers(0, 65536, size=size, dtype=np.uint16)
+    fixtures.create_shard(f"{root}/data/{name}.data", f"{root}/meta/{name}.meta", old, (c, c, c))
+    # The new version, outside any dataset on the same filesystem
+    new = np.random.default_rng(12).integers(0, 65536, size=size, dtype=np.uint16)
+    os.makedirs(os.path.join(server.data_dir, "sc_rename_next"))
+    fixtures.create_shard(f"{server.data_dir}/sc_rename_next/{name}.data",
+                          f"{server.data_dir}/sc_rename_next/{name}.meta", new, (c, c, c))
+    one = f"/{ds}/1/" + box(0, 1, 0, 1, 0, 1)
+    results[f"{sid}: first read"] = digest(*server.request("GET", one))
+
+    long_read = {}
+    th = threading.Thread(target=lambda: long_read.update(
+        r=server.request("GET", f"/{ds}+project={Z}/1/" + box(0, X, 0, Y, 0, 1))))
+    th.start()
+    time.sleep(0.05)
+    # In the container: a file shared from the host can be read with its old
+    # contents for a moment after a rename on the host
+    server.exec("sh", "-c", f"mv /data/sc_rename_next/{name}.data /data/{ds}/data/{name}.data && "
+                            f"mv /data/sc_rename_next/{name}.meta /data/{ds}/meta/{name}.meta")
+    results[f"{sid}: one voxel after the rename"] = digest(*server.request("GET", one))
+    th.join()
+    results[f"{sid}: long read"] = {"status": long_read["r"][0], "len": None, "sha256": None, "text": None}
+
+    last = f"/{ds}/1/" + box(X - c, X, Y - c, Y, Z - c, Z)
+    expect = np.ascontiguousarray(new[X - c:, Y - c:, Z - c:].transpose(2, 1, 0)).tobytes()
+    st, body = server.request("GET", last)
+    results[f"{sid}: chunk read last, read after"] = digest(st, body)
+    results[f"{sid}: chunk read last, is the new files'"] = {
+        "status": "match" if st == 200 and body == expect else "mismatch", "len": None, "sha256": None, "text": None}
+    edit = f"/{ds}+token={fixtures.TOKEN}/write/1/" + box(X - c, X - c + 1, Y - c, Y - c + 1, Z - c, Z - c + 1)
+    results[f"{sid}: PATCH one voxel of it"] = digest(*server.request("PATCH", edit, np.array([7], dtype=np.uint16).tobytes()))
+    st, body = server.request("GET", last)
+    results[f"{sid}: the chunk after the PATCH"] = digest(st, body)
+    expect = np.frombuffer(expect, dtype=np.uint16).copy()
+    expect[0] = 7
+    results[f"{sid}: the chunk after the PATCH, is the new files' with the edit"] = {
+        "status": "match" if st == 200 and body == expect.tobytes() else "mismatch",
+        "len": None, "sha256": None, "text": None}
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
 # s7 runs last: production dies in it, and nothing should depend on a server
@@ -1061,11 +1129,12 @@ SCENARIOS = [
     ("s18 skeleton_api writes", sc_skeleton_api_writes),
     ("s13 channel filter", sc_channel_filter),
     ("s14 read limit", sc_read_limit),
+    ("s15 files replaced during a read", sc_replaced_during_read),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
 SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short", "sc_strict", "sc_regrow", "sc_regrow_w",
-                     "sc_cold", "sc_video", "sc_ka_image", "sc_ka_labels"]
+                     "sc_cold", "sc_video", "sc_ka_image", "sc_ka_labels", "sc_rename"]
 
 
 def run_scenarios(server, results):

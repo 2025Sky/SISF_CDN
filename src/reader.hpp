@@ -265,6 +265,7 @@ log_limiter log_limit_read_refused;
 log_limiter log_limit_write_refused;
 log_limiter log_limit_write_failed;
 log_limiter log_limit_archive_meta;
+log_limiter log_limit_files_replaced;
 
 // https://stackoverflow.com/questions/8401777/simple-glob-in-c-on-unix-system
 std::vector<std::string> glob_tool(const std::string &pattern)
@@ -331,6 +332,35 @@ int64_t get_file_mtime_ns(const std::string &filename)
     return 0;
 }
 
+// A file's device and inode, (0, 0) if it does not exist. Two looks at the
+// same path differ when the file was replaced in between (a rename over it,
+// or a delete and a new file), not when it was written in place.
+std::pair<uint64_t, uint64_t> get_file_identity(const std::string &filename)
+{
+    struct stat result;
+    if (stat(filename.c_str(), &result) == 0)
+    {
+        return {(uint64_t)result.st_dev, (uint64_t)result.st_ino};
+    }
+    return {0, 0};
+}
+
+// The .meta and .data of an mchunk by device and inode; see get_file_identity
+struct mchunk_file_ids
+{
+    std::pair<uint64_t, uint64_t> meta{0, 0}, data{0, 0};
+
+    bool operator==(const mchunk_file_ids &o) const
+    {
+        return meta == o.meta && data == o.data;
+    }
+
+    bool operator!=(const mchunk_file_ids &o) const
+    {
+        return !(*this == o);
+    }
+};
+
 struct metadata_entry
 {
     uint64_t offset;
@@ -374,8 +404,14 @@ struct shard_files
     // Could not be opened in IO_RETRY_COUNT tries during this request
     bool meta_unopenable = false;
     bool data_unopenable = false;
+    // The mchunk's data_gen when the request took its header, before either
+    // file was opened. A descriptor stays on the file it opened even after
+    // the file is replaced (e.g. by a rename) and the header reloaded, so a
+    // chunk read through these files may go into the global cache only while
+    // data_gen still has this value.
+    const uint64_t data_gen;
 
-    shard_files() = default;
+    explicit shard_files(uint64_t gen) : data_gen(gen) {}
     shard_files(const shard_files &) = delete;
     shard_files &operator=(const shard_files &) = delete;
 
@@ -425,6 +461,66 @@ bool pread_all(int fd, char *buf, size_t n, uint64_t offset)
     return true;
 }
 
+// Writes exactly n bytes at offset; false on an error
+bool pwrite_all(int fd, const char *buf, size_t n, uint64_t offset)
+{
+    while (n > 0)
+    {
+        const ssize_t w = pwrite(fd, buf, n, (off_t)offset);
+        if (w < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (w <= 0)
+        {
+            return false;
+        }
+        buf += w;
+        n -= (size_t)w;
+        offset += (uint64_t)w;
+    }
+    return true;
+}
+
+// An open file's device and inode, (0, 0) if fstat fails; see get_file_identity
+std::pair<uint64_t, uint64_t> get_fd_identity(int fd)
+{
+    struct stat result;
+    if (fstat(fd, &result) == 0)
+    {
+        return {(uint64_t)result.st_dev, (uint64_t)result.st_ino};
+    }
+    return {0, 0};
+}
+
+// Closes a descriptor when it goes out of scope
+struct fd_closer
+{
+    int fd = -1;
+
+    fd_closer() = default;
+    fd_closer(const fd_closer &) = delete;
+    fd_closer &operator=(const fd_closer &) = delete;
+
+    ~fd_closer()
+    {
+        close();
+    }
+
+    // False if close reports an error, which can be a write that failed late
+    // (e.g. on NFS)
+    bool close()
+    {
+        if (fd < 0)
+        {
+            return true;
+        }
+        const int r = ::close(fd);
+        fd = -1;
+        return r == 0;
+    }
+};
+
 class packed_reader
 {
 private:
@@ -457,10 +553,42 @@ public:
 
     // Bumped, under global_chunk_cache_mutex, after a chunk of this mchunk is
     // rewritten and when its cache lines are dropped. load_chunk samples it
-    // before reading a chunk's entry and puts its decode in the global cache
-    // only if it has not moved: a decode begun before a write finished may be
-    // of the old chunk, and the write's invalidation has already run.
+    // before reading a chunk's entry (a request reading through shard_files
+    // sampled it once, before it opened them) and puts its decode in the
+    // global cache only if it has not moved: a decode begun before a write
+    // finished may be of the old chunk, and the write's invalidation has
+    // already run.
     std::atomic<uint64_t> data_gen{0};
+
+    // Bumped with data_gen when a reload finds other files at meta_fname or
+    // data_fname than the last successful read of the header did (a file was
+    // replaced, e.g. by a rename, or deleted and made again), or a different
+    // header. A reload after an edit in place that leaves the header as it
+    // was, such as the one a reader can start after this CDN's own write,
+    // leaves it alone. A write refuses to put back chunks it read before it
+    // moved.
+    std::atomic<uint64_t> file_gen{0};
+
+    // The .meta and .data (device and inode) as they were just before the
+    // header was last read successfully; 0 for a file that did not exist
+    std::atomic<uint64_t> meta_dev_seen{0}, meta_ino_seen{0};
+    std::atomic<uint64_t> data_dev_seen{0}, data_ino_seen{0};
+
+    mchunk_file_ids files_seen() const
+    {
+        mchunk_file_ids ids;
+        ids.meta = {meta_dev_seen.load(), meta_ino_seen.load()};
+        ids.data = {data_dev_seen.load(), data_ino_seen.load()};
+        return ids;
+    }
+
+    mchunk_file_ids files_on_disk() const
+    {
+        mchunk_file_ids ids;
+        ids.meta = get_file_identity(meta_fname);
+        ids.data = get_file_identity(data_fname);
+        return ids;
+    }
 
     packed_reader(size_t chunk_id, std::string metadata_fname_in, std::string data_fname_in)
     {
@@ -494,11 +622,15 @@ public:
         return false;
     }
 
-    void clear_cache_lines()
+    void clear_cache_lines(bool files_changed = false)
     {
         std::lock_guard<std::timed_mutex> lock(global_chunk_cache_mutex);
         // A decode made under the header being replaced must not come back
         data_gen.fetch_add(1);
+        if (files_changed)
+        {
+            file_gen.fetch_add(1);
+        }
         for (size_t i = 0; i < global_cache_size; i++)
         {
             if (global_chunk_cache[i].mchunk == this_mchunk_id)
@@ -510,6 +642,12 @@ public:
 
     void reload_metadata(bool reset_cache = true)
     {
+        // Taken before the header is read, so that a file replaced while it
+        // is read also counts as changed at the next reload
+        const mchunk_file_ids ids = files_on_disk();
+        const bool was_valid = is_valid;
+        const shard_geometry before = was_valid ? geometry() : shard_geometry();
+
         std::ifstream file(meta_fname, std::ios::in | std::ios::binary);
 
         if (file.fail())
@@ -587,9 +725,15 @@ public:
 
         is_valid = true;
 
+        const bool files_changed = !was_valid || geometry() != before || ids != files_seen();
+        meta_dev_seen.store(ids.meta.first);
+        meta_ino_seen.store(ids.meta.second);
+        data_dev_seen.store(ids.data.first);
+        data_ino_seen.store(ids.data.second);
+
         if (reset_cache)
         {
-            clear_cache_lines();
+            clear_cache_lines(files_changed);
         }
     }
 
@@ -811,7 +955,8 @@ public:
         return out;
     }
 
-    bool replace_meta_entry(size_t id, metadata_entry *new_entry)
+    // Writes chunk id's entry into the .meta open as meta_file, and closes it
+    bool replace_meta_entry(fd_closer &meta_file, size_t id, const metadata_entry &new_entry)
     {
         if (!is_valid)
         {
@@ -821,34 +966,19 @@ public:
 
         const size_t offset = header_size + (entry_file_line_size * id);
 
-        for (size_t i = 0; i < IO_RETRY_COUNT; i++)
+        char line[sizeof(uint64_t) + sizeof(uint32_t)];
+        memcpy(line, &new_entry.offset, sizeof(uint64_t));
+        memcpy(line + sizeof(uint64_t), &new_entry.size, sizeof(uint32_t));
+        if (!pwrite_all(meta_file.fd, line, sizeof(line), offset) || !meta_file.close())
         {
-            std::fstream file(meta_fname, std::ios::in | std::ios::out | std::ios::binary);
-
-            if (file.fail())
+            std::string note;
+            if (log_limit_entry_write.allow(note))
             {
-                std::cerr << "Fopen failed (metadata write)" << std::endl;
-                continue;
+                std::cerr << "Metadata entry write failed: " << meta_fname << " chunk " << id << note << std::endl;
             }
-
-            file.seekp(offset);
-            file.write((char *)&(new_entry->offset), sizeof(uint64_t));
-            file.write((char *)&(new_entry->size), sizeof(uint32_t));
-            file.close();
-
-            if (file.fail())
-            {
-                std::string note;
-                if (log_limit_entry_write.allow(note))
-                {
-                    std::cerr << "Metadata entry write failed: " << meta_fname << " chunk " << id << note << std::endl;
-                }
-                return false;
-            }
-            return true;
+            return false;
         }
-
-        return false;
+        return true;
     }
 
     std::mutex chunk_cache_mutex;
@@ -880,8 +1010,9 @@ public:
             return NULL;
         }
 
-        // Before the entry is read; see data_gen
-        const uint64_t gen = data_gen.load();
+        // Before the entry is read, or for a read through files, before they
+        // were opened; see data_gen
+        const uint64_t gen = files != nullptr ? files->data_gen : data_gen.load();
 
         bool entry_failed = false;
         metadata_entry *sel = files != nullptr ? read_meta_entry(*g, *files, id, &entry_failed)
@@ -1082,7 +1213,8 @@ public:
             {
                 std::unique_lock<std::timed_mutex> lock(global_chunk_cache_mutex, cache_lock_timeout);
                 // If data_gen moved, a write to this mchunk finished while this chunk
-                // was read, so this decode may be the chunk it replaced
+                // was read, so this decode may be the chunk it replaced, or a reload
+                // found other files than the ones it was read from
                 if (lock.owns_lock() && data_gen.load() == gen)
                 {
                     uint16_t *line_ptr = (uint16_t *)read_decomp_buffer;
@@ -1098,8 +1230,18 @@ public:
         return out;
     }
 
-    // Returns false if the chunk may not be on disk as requested
-    bool overwrite_chunk(size_t id, uint16_t *data, size_t data_size)
+    // Returns false if the chunk may not be on disk as requested.
+    //
+    // expected names the .meta and .data the write was prepared against (its
+    // chunks placed with their header, and the ones it did not cover whole
+    // merged with voxels read from them). Both files are opened first and
+    // checked through their descriptors: if either has been replaced since
+    // (e.g. by a rename), nothing is written, since that would put those
+    // voxels into the new files. The chunk and its entry then both go to the
+    // files checked, never one to each. If the files are replaced while they
+    // are written, false is returned and the .meta's time is not taken as
+    // this write's, so the next check of the .meta still finds the change.
+    bool overwrite_chunk(size_t id, uint16_t *data, size_t data_size, const mchunk_file_ids &expected)
     {
         // compress data using ZSTD
         size_t compressed_size = ZSTD_compressBound(data_size);
@@ -1123,27 +1265,52 @@ public:
         }
 
         bool entry_written;
+        bool files_kept;
         {
             // Released on every return and if anything below throws
             std::lock_guard<std::timed_mutex> lock(global_chunk_cache_mutex);
 
-            // Write to file
-            std::fstream file(data_fname, std::ios::in | std::ios::out | std::ios::binary);
-            if (file.fail())
+            fd_closer data_file, meta_file;
+            data_file.fd = open(data_fname.c_str(), O_RDWR | O_CLOEXEC);
+            if (data_file.fd < 0)
             {
                 std::cerr << "Fopen failed (write)" << std::endl;
                 free(compressed_data);
                 return false;
             }
+            for (size_t i = 0; i < IO_RETRY_COUNT && meta_file.fd < 0; i++)
+            {
+                meta_file.fd = open(meta_fname.c_str(), O_RDWR | O_CLOEXEC);
+                if (meta_file.fd < 0)
+                {
+                    std::cerr << "Fopen failed (metadata write)" << std::endl;
+                }
+            }
+            if (meta_file.fd < 0)
+            {
+                free(compressed_data);
+                return false;
+            }
 
-            file.seekp(0, std::ios::end);
-            size_t new_offset = file.tellp();
-            // file.seekp(sel->offset);
-            file.write((char *)compressed_data, compressed_size);
-            file.close();
+            if (get_fd_identity(data_file.fd) != expected.data || get_fd_identity(meta_file.fd) != expected.meta)
+            {
+                std::string note;
+                if (log_limit_files_replaced.allow(note))
+                {
+                    std::cerr << "Chunk write refused (mchunk files replaced during the write): " << data_fname
+                              << " chunk " << id << note << std::endl;
+                }
+                free(compressed_data);
+                return false;
+            }
+
+            // Write to file
+            const off_t new_offset = lseek(data_file.fd, 0, SEEK_END);
 
             // Never point the entry at bytes that did not reach the file
-            if (new_offset == (size_t)-1 || file.fail())
+            if (new_offset < 0 ||
+                !pwrite_all(data_file.fd, (const char *)compressed_data, compressed_size, (uint64_t)new_offset) ||
+                !data_file.close())
             {
                 std::string note;
                 if (log_limit_append.allow(note))
@@ -1155,14 +1322,27 @@ public:
             }
 
             metadata_entry new_entry;
-            new_entry.offset = new_offset;
+            new_entry.offset = (uint64_t)new_offset;
             new_entry.size = compressed_size;
 
-            entry_written = replace_meta_entry(id, &new_entry);
+            entry_written = replace_meta_entry(meta_file, id, new_entry);
 
-            // Update cached mtime so our own write is not detected as
-            // an external modification on the next read.
-            last_meta_read_time = get_file_mtime_ns(meta_fname);
+            files_kept = files_on_disk() == expected;
+            if (files_kept)
+            {
+                // Update cached mtime so our own write is not detected as
+                // an external modification on the next read.
+                last_meta_read_time = get_file_mtime_ns(meta_fname);
+            }
+            else
+            {
+                std::string note;
+                if (log_limit_files_replaced.allow(note))
+                {
+                    std::cerr << "Chunk written to mchunk files replaced during the write: " << data_fname
+                              << " chunk " << id << note << std::endl;
+                }
+            }
 
             // After the entry is on disk and before the lines are dropped: a
             // reader that sampled data_gen before this will not insert
@@ -1177,7 +1357,7 @@ public:
         }
 
         free(compressed_data);
-        return entry_written;
+        return entry_written && files_kept;
     }
 
     uint16_t read_pixel(size_t i, size_t j, size_t k)
@@ -1920,6 +2100,10 @@ public:
         size_t c = 0, mi = 0, mj = 0, mk = 0;
         packed_reader *reader = nullptr;
         shard_geometry g;
+        // The reader's data_gen, file_gen and the files it last read its
+        // header from, taken just before g
+        uint64_t data_gen = 0, file_gen = 0;
+        mchunk_file_ids file_ids;
         size_t bx = 0, by = 0, bz = 0;
         size_t lx0 = 0, lx1 = 0, ly0 = 0, ly1 = 0, lz0 = 0, lz1 = 0;
 
@@ -2054,6 +2238,8 @@ public:
                 continue;
             }
 
+            // Before the header is taken and the files are opened
+            s.data_gen = r->data_gen.load();
             s.g = r->geometry();
             if (s.g.chunkx == 0 || s.g.chunky == 0 || s.g.chunkz == 0)
             {
@@ -2080,7 +2266,7 @@ public:
             }
 
             uint16_t *out = out_buffer + ((s.c - c0) * osizex * osizey * osizez);
-            shard_files files;
+            shard_files files(s.data_gen);
             for_each_chunk(s, ex, ey, ez, [&](const chunk_span &k)
                            {
                 uint16_t *chunk = r->load_chunk(k.id, k.cxsize, k.cysize, k.czsize, &failed, &s.g, &files);
@@ -2663,9 +2849,11 @@ public:
     // changed on disk) is usable, and the box lies inside its stored tile.
     // Then every chunk the box touches is merged with the request: one the
     // box covers entirely starts from zeros, any other is read first, and one
-    // that cannot be read refuses the whole write. Then the chunks are
-    // written in the order the voxel loop wrote them, except a partly covered
-    // chunk that the request leaves exactly as it was stored.
+    // that cannot be read refuses the whole write. Then each mchunk is checked
+    // again: a header or files other than the ones the chunks were placed
+    // with and read from refuse the whole write. Then the chunks are written
+    // in the order the voxel loop wrote them, except a partly covered chunk
+    // that the request leaves exactly as it was stored.
     bool replace_region(
         size_t scale,
         size_t xs, size_t xe,
@@ -2740,6 +2928,13 @@ public:
                         // Pick up a header rewritten on disk before any offset is computed
                         // from it, once per mchunk per request
                         r->reload_if_modified();
+                        // Also files replaced by ones with the same .meta time (e.g. a copy
+                        // that kept it): each chunk write checks the files against the ones
+                        // the header was read from
+                        if (r->files_on_disk() != r->files_seen())
+                        {
+                            r->reload_metadata();
+                        }
 
                         if (!r->is_valid)
                         {
@@ -2752,6 +2947,10 @@ public:
                         s.mj = mj;
                         s.mk = mk;
                         s.reader = r;
+                        // Before the header is taken and the files are opened
+                        s.data_gen = r->data_gen.load();
+                        s.file_gen = r->file_gen.load();
+                        s.file_ids = r->files_seen();
                         s.g = r->geometry();
                         if (s.g.chunkx == 0 || s.g.chunky == 0 || s.g.chunkz == 0)
                         {
@@ -2782,7 +2981,7 @@ public:
             const char *refusal = nullptr;
             std::string refusal_where;
 
-            shard_files files;
+            shard_files files(s.data_gen);
             const bool prepared = for_each_chunk(s, s.lx1, s.ly1, s.lz1, [&](const chunk_span &k) -> bool
                                                  {
                 write_chunk w{si, k, nullptr, false, false};
@@ -2852,10 +3051,15 @@ public:
         }
 
         // 3. The chunks were placed with each mchunk's header as this request
-        // took it; if another request has since reloaded a different one,
-        // writing them would put them in the wrong place
+        // took it, and the ones it did not cover whole were read from the files
+        // that were there then (through its own descriptors, or from cache
+        // lines). A .meta changed on disk since is reloaded here. If a reload
+        // since then found another header, writing the chunks would put them
+        // in the wrong place; if it found other files (e.g. both replaced by a
+        // rename), it would put the old files' voxels into the new ones.
         for (const region_shard &s : shards)
         {
+            s.reader->reload_if_modified();
             if (!s.reader->is_valid)
             {
                 return reject("Unusable mchunk header", s.reader->meta_fname);
@@ -2863,6 +3067,10 @@ public:
             if (s.reader->geometry() != s.g)
             {
                 return reject("Chunk extent changed during the write", s.reader->meta_fname);
+            }
+            if (s.reader->file_gen.load() != s.file_gen)
+            {
+                return reject("Mchunk files replaced during the write", s.reader->meta_fname);
             }
         }
 
@@ -2875,7 +3083,8 @@ public:
             if (w.full || w.changed)
             {
                 const size_t chunk_size = w.span.cxsize * w.span.cysize * w.span.czsize * sizeof(uint16_t);
-                if (!shards[w.shard].reader->overwrite_chunk(w.span.id, w.ptr, chunk_size))
+                const region_shard &s = shards[w.shard];
+                if (!s.reader->overwrite_chunk(w.span.id, w.ptr, chunk_size, s.file_ids))
                 {
                     all_written = false;
                 }
