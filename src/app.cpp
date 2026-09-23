@@ -2203,6 +2203,21 @@ int main(int argc, char *argv[])
 		char project_axis = 0;		 // Axis to max project along
 		projectfunction project_mode = max_project; // What projection function to use
 
+		// The portal sends its token on the read before every PATCH, whose
+		// answer it merges and writes back, and on its algorithm reads;
+		// viewers send none. Such a read fails with 500 when a chunk that
+		// exists could not be read, instead of answering zeros for it that
+		// the portal would then write over the stored labels.
+		bool strict_read = false;
+		for (const auto &pair : filters)
+		{
+			if (pair.first == "token")
+			{
+				strict_read = true;
+			}
+		}
+		bool read_failed = false;
+
 		// Check for project parameters in filters list
 		for (const auto &pair : filters)
 		{
@@ -2305,7 +2320,8 @@ int main(int argc, char *argv[])
 				scale,
 				x_begin_project, x_end_project,
 				y_begin_project, y_end_project,
-				z_begin_project, z_end_project
+				z_begin_project, z_end_project,
+				strict_read ? &read_failed : nullptr
 			);
 
 			uint16_t vout;
@@ -2397,8 +2413,17 @@ int main(int argc, char *argv[])
 				scale,
 				x_begin, x_end,
 				y_begin, y_end,
-				z_begin, z_end
+				z_begin, z_end,
+				strict_read ? &read_failed : nullptr
 			);
+		}
+
+		if (read_failed)
+		{
+			free(out_buffer);
+			res.code = crow::status::INTERNAL_SERVER_ERROR;
+			res.end("500 Internal Server Error -- Could not read chunk\n");
+			return;
 		}
 
 		for(const auto& pair : filters) {

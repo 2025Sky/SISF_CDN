@@ -138,6 +138,7 @@ log_limiter log_limit_entry_write;
 log_limiter log_limit_write_oom;
 log_limiter log_limit_append;
 log_limiter log_limit_read_outside;
+log_limiter log_limit_read_refused;
 log_limiter log_limit_write_refused;
 log_limiter log_limit_write_failed;
 
@@ -1455,11 +1456,16 @@ public:
         return out;
     }
 
+    // With failed set, a chunk that exists but cannot be read (the .meta or
+    // .data cannot be opened or is short, the data does not decode, memory
+    // runs out) sets *failed; its voxels read as 0 either way. A chunk never
+    // written or a missing mchunk is not a failure.
     uint16_t *load_region(
         size_t scale,
         size_t xs, size_t xe,
         size_t ys, size_t ye,
-        size_t zs, size_t ze)
+        size_t zs, size_t ze,
+        bool *failed = nullptr)
     {
         std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 
@@ -1623,7 +1629,7 @@ public:
                                 chunk = chunk_cache[*chunk_identifier];
                                 if (chunk == 0)
                                 {
-                                    chunk = chunk_reader->load_chunk(sub_chunk_id, cxsize, cysize, czsize);
+                                    chunk = chunk_reader->load_chunk(sub_chunk_id, cxsize, cysize, czsize, failed);
                                     chunk_cache[*chunk_identifier] = chunk;
                                 }
 
@@ -1673,6 +1679,13 @@ public:
                               << " scale " << scale << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze
                               << " (archive geometry may be stale)" << note << std::endl;
                 }
+            }
+
+            if (failed != nullptr && *failed && log_limit_read_refused.allow(note))
+            {
+                std::cerr << "Read failed (could not read chunk): " << fname
+                          << " scale " << scale << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze
+                          << note << std::endl;
             }
         }
         else if (type == ZARR)
