@@ -72,9 +72,10 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
     a coarser level, a projection, a gaussian filter), and channels that do
     not exist;
   - s14: a second server on the same data started with `MAX_READ_VOXELS`
-    set: reads under, at and over the limit, a projection over it, a
-    reversed box, one channel of a box that is over it with every channel,
-    and a server whose limit is not a number;
+    set (a box, per channel): image reads under, at and over the limit on
+    the 3-channel and the 1-channel fixture, a projection at and over it, a
+    reversed box, one channel of a box over it, `tracing` and `raw_access`
+    under and over it, and a server whose limit is not a number;
   - s15: an mchunk's `.meta` and `.data` replaced by rename (inside the
     container) while a long read of it is under way, then read and PATCHed
     after another read reloaded the header: the chunk the long read read

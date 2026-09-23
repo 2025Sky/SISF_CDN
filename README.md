@@ -141,7 +141,7 @@ Two more environment variables size the server:
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `CHUNK_CACHE_LINES` | `100` | How many decoded chunks the server keeps in memory for reuse. Each holds one chunk (64 KiB for a 32x32x32 `uint16` chunk). A value that is not a whole number from 1 to 1000000 is ignored with a log line. |
-| `MAX_READ_VOXELS` | `0` (no limit) | The most voxels times returned channels one image read may assemble; a larger read answers `400`. A projection counts the box it reads, not the one it returns. A value that is not a whole number is ignored with a log line. |
+| `MAX_READ_VOXELS` | `0` (no limit) | The most voxels one read may cover, per channel: a larger box answers `400` on the image route, `tracing` (the box it reads around its two points) and `raw_access`, whatever the dataset's channel count, and `channel=<n>` does not allow a larger box. A projection counts the box it reads, not the one it returns. A value that is not a whole number is ignored with a log line. |
 
 ## Sample Data
 

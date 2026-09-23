@@ -686,23 +686,37 @@ def sc_channel_filter(server, results, sid):
 
 
 def sc_read_limit(server, results, sid):
-    """MAX_READ_VOXELS caps the voxels x channels one read assembles. A
-    second server on the same data starts with the limit set to what a
-    70x60x19 read of the 3-channel fixture needs. That read, and one plane
-    less, answer as without a limit; one plane more answers 400, and so does
-    a projection of one plane that reads all 20; the whole box with one
-    channel selected fits and equals that channel of the whole read. A
-    server whose limit is not a number logs that it ignores it and reads as
-    without one. Production ignores the variable."""
-    limit = 70 * 60 * 19 * 3
+    """MAX_READ_VOXELS caps the box one read covers, per channel. A second
+    server on the same data starts with the limit set to 70x60x19 voxels.
+    On the image route a read of that many voxels, and one plane less,
+    answer as without a limit, on the 3-channel fixture and on the 1-channel
+    one; one plane more answers 400 on both (a dataset's channel count does
+    not change the box it may read), and so do a projection of one plane
+    that reads all 20, and that box with one channel selected. tracing answers
+    400 when the box it reads around its two points is over the limit and as
+    without one under it; so does raw_access. A server whose limit is not a
+    number logs that it ignores it and reads as without one. Production
+    ignores the variable."""
+    limit = 70 * 60 * 19
     for env, cases in (
             ({"MAX_READ_VOXELS": str(limit)}, [
                 ("under the limit", "/vol3c/1/" + box(0, 70, 0, 60, 0, 18)),
                 ("at the limit", "/vol3c/1/" + box(0, 70, 0, 60, 0, 19)),
                 ("one plane over", "/vol3c/1/" + box(0, 70, 0, 60, 0, 20)),
+                ("1 channel, at the limit", "/vol1c/1/" + box(0, 70, 0, 60, 0, 19)),
+                ("1 channel, one plane over", "/vol1c/1/" + box(0, 70, 0, 60, 0, 20)),
+                # project=N reads the box's plane and the N after it
                 ("projection at the limit", "/vol3c+project=18/1/" + box(0, 70, 0, 60, 0, 1)),
                 ("projection over", "/vol3c+project=20/1/" + box(0, 70, 0, 60, 0, 1)),
-                ("reversed box", "/vol3c/1/" + box(8, 2, 0, 8, 0, 1))]),
+                ("reversed box", "/vol3c/1/" + box(8, 2, 0, 8, 0, 1)),
+                ("whole box, one channel", "/vol3c+channel=1/1/" + box(0, 70, 0, 60, 0, 20)),
+                # The box is the points' bounding box widened by 5 and clamped
+                # to the image: 12x11x11 here, 70x60x20 below
+                ("tracing under the limit", "/vol1c/tracing/10,10,10/11,10,10"),
+                ("tracing over", "/vol3c/tracing/0,0,0/69,59,19"),
+                # vol1c's mchunk (0,0,0) stores 64x64x32
+                ("raw_access at the limit", "/vol1c/raw_access/0,0,0,0/1/" + box(0, 64, 0, 64, 0, 19)),
+                ("raw_access over", "/vol1c/raw_access/0,0,0,0/1/" + box(0, 64, 0, 64, 0, 20))]),
             ({"MAX_READ_VOXELS": "lots"}, [("limit not a number", "/vol3c/1/" + box(0, 70, 0, 60, 0, 20))])):
         tag = env["MAX_READ_VOXELS"]
         limited = Server(f"{server.role}-limit-{tag}", server.image, server.platform, server.data_dir, env)
@@ -710,12 +724,7 @@ def sc_read_limit(server, results, sid):
             limited.start()
             for name, path in cases:
                 results[f"{sid}: {name}"] = digest(*limited.request("GET", path))
-            if tag == str(limit):
-                st, full = server.request("GET", "/vol3c/1/" + box(0, 70, 0, 60, 0, 20))
-                st1, part = limited.request("GET", "/vol3c+channel=1/1/" + box(0, 70, 0, 60, 0, 20))
-                results[f"{sid}: whole box, one channel"] = (_slice_check(full, part, 1, 3) if st == st1 == 200
-                                                             else digest(st1, part))
-            else:
+            if tag != str(limit):
                 log = "\n".join(limited.logs_tail(200))
                 results[f"{sid}: limit not a number, logged"] = {
                     "status": "logged" if "MAX_READ_VOXELS ignored" in log else "not logged",

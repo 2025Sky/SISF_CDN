@@ -44,9 +44,33 @@ Licensed under the terms specified in LICENSE.md
 int port = 100;
 int THREAD_COUNT = 32;
 bool READ_ONLY_MODE = false;
-// MAX_READ_VOXELS: the most voxels times channels one image read may
-// assemble; 0 (the default) is no limit
+// MAX_READ_VOXELS: the most voxels one read may cover, per channel: a larger
+// box answers 400 whatever the dataset's channel count, and selecting one
+// channel does not allow a larger one. Every route that reads a box the
+// client chooses checks it (the image route, tracing, raw_access). 0 (the
+// default) is no limit.
 size_t MAX_READ_VOXELS = 0;
+
+// Whether a read of an x by y by z box is within MAX_READ_VOXELS; always
+// true when no limit is set
+bool read_within_limit(size_t x, size_t y, size_t z)
+{
+	if (MAX_READ_VOXELS == 0)
+	{
+		return true;
+	}
+	size_t voxels = 0;
+	return !__builtin_mul_overflow(x, y, &voxels) && !__builtin_mul_overflow(voxels, z, &voxels) &&
+		   voxels <= MAX_READ_VOXELS;
+}
+
+// The answer to a read over MAX_READ_VOXELS
+std::string read_too_large(size_t x, size_t y, size_t z)
+{
+	return "400 Bad Request -- Read too large: " + std::to_string(x) + "x" + std::to_string(y) + "x" + std::to_string(z) +
+		   " voxels is more than the limit of " + std::to_string(MAX_READ_VOXELS) +
+		   " voxels per channel; read a smaller box\n";
+}
 
 // skeleton_api's upload, replace and delete change traces.sql without any
 // token check (delete is a GET), so they are off unless SKELETON_API_WRITES=1.
@@ -591,6 +615,42 @@ int main(int argc, char *argv[])
 			}
 		}
 
+		// The box read below: the two points' bounding box, widened by the
+		// window and clamped to the image
+		int region_start_x = std::min(pt1[0], pt2[0]);
+		int region_end_x = std::max(pt1[0], pt2[0]);
+		int region_start_y = std::min(pt1[1], pt2[1]);
+		int region_end_y = std::max(pt1[1], pt2[1]);
+		int region_start_z = std::min(pt1[2], pt2[2]);
+		int region_end_z = std::max(pt1[2], pt2[2]);
+
+		const int window = 5; // window to dilate sampled region by for overlaps 
+
+		region_start_x -= window;
+		region_end_x += window;
+		region_start_y -= window;
+		region_end_y += window;
+		region_start_z -= window;
+		region_end_z += window;
+
+		region_start_x = std::max(region_start_x, (int) 0);
+		region_start_y = std::max(region_start_y, (int) 0);
+		region_start_z = std::max(region_start_z, (int) 0);
+		region_end_x = std::min(region_end_x, (int) reader->sizex); 
+		region_end_y = std::min(region_end_y, (int) reader->sizey); 
+		region_end_z = std::min(region_end_z, (int) reader->sizez); 
+
+		const size_t region_size_x = region_end_x - region_start_x;
+		const size_t region_size_y = region_end_y - region_start_y;
+		const size_t region_size_z = region_end_z - region_start_z;
+
+		if (!read_within_limit(region_size_x, region_size_y, region_size_z))
+		{
+			res.code = crow::status::BAD_REQUEST;
+			res.end(read_too_large(region_size_x, region_size_y, region_size_z));
+			return;
+		}
+
 		std::stringstream out;
 
 		auto coord_cmp = [](astar_cell *a, astar_cell *b) { return a->x < b->x || (a->x == b->x && a->y < b->y) || (a->x == b->x && a->y == b->y && a->z < b->z); };
@@ -618,33 +678,6 @@ int main(int argc, char *argv[])
 
 		const bool use_buffering = true;
 		uint16_t * region_data = nullptr;
-
-		int region_start_x = std::min(start->x, end->x);
-		int region_end_x = std::max(start->x, end->x);
-		int region_start_y = std::min(start->y, end->y);
-		int region_end_y = std::max(start->y, end->y);
-		int region_start_z = std::min(start->z, end->z);
-		int region_end_z = std::max(start->z, end->z);
-
-		const int window = 5; // window to dilate sampled region by for overlaps 
-
-		region_start_x -= window;
-		region_end_x += window;
-		region_start_y -= window;
-		region_end_y += window;
-		region_start_z -= window;
-		region_end_z += window;
-
-		region_start_x = std::max(region_start_x, (int) 0);
-		region_start_y = std::max(region_start_y, (int) 0);
-		region_start_z = std::max(region_start_z, (int) 0);
-		region_end_x = std::min(region_end_x, (int) reader->sizex); 
-		region_end_y = std::min(region_end_y, (int) reader->sizey); 
-		region_end_z = std::min(region_end_z, (int) reader->sizez); 
-
-		const size_t region_size_x = region_end_x - region_start_x;
-		const size_t region_size_y = region_end_y - region_start_y;
-		const size_t region_size_z = region_end_z - region_start_z;
 
 		if(true) { 
 			std::cout << "Getting range: [" << region_start_x << "," << region_end_x << "], ["
@@ -1925,6 +1958,13 @@ int main(int argc, char *argv[])
 			return;
 		}
 
+		if (!read_within_limit(chunk_sizes[0], chunk_sizes[1], chunk_sizes[2]))
+		{
+			res.code = crow::status::BAD_REQUEST;
+			res.end(read_too_large(chunk_sizes[0], chunk_sizes[1], chunk_sizes[2]));
+			return;
+		}
+
 		uint16_t * out_buffer = (uint16_t*) malloc(out_buffer_size);
 		if (out_buffer == NULL)
 		{
@@ -2450,23 +2490,18 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		if (MAX_READ_VOXELS > 0)
 		{
-			// A reversed box wraps to a huge size and counts as too large
+			// The box read. The limit is per channel, so +channel=N does not
+			// change it, and a Zarr or descriptor dataset (which reads every
+			// channel even then) is held to the same box. A reversed box wraps
+			// to a huge size and counts as too large.
 			const size_t read_x = x_end_project - x_begin_project;
 			const size_t read_y = y_end_project - y_begin_project;
 			const size_t read_z = z_end_project - z_begin_project;
-			size_t read_voxels = 0;
-			if (__builtin_mul_overflow(read_x, read_y, &read_voxels) ||
-				__builtin_mul_overflow(read_voxels, read_z, &read_voxels) ||
-				__builtin_mul_overflow(read_voxels, channels_out, &read_voxels) ||
-				read_voxels > MAX_READ_VOXELS)
+			if (!read_within_limit(read_x, read_y, read_z))
 			{
 				res.code = crow::status::BAD_REQUEST;
-				res.end("400 Bad Request -- Read too large: " + std::to_string(read_x) + "x" + std::to_string(read_y) + "x" +
-						std::to_string(read_z) + " voxels x " + std::to_string(channels_out) +
-						" channels is more than the limit of " + std::to_string(MAX_READ_VOXELS) +
-						"; read a smaller box, or one channel with +channel=N\n");
+				res.end(read_too_large(read_x, read_y, read_z));
 				return;
 			}
 		}
@@ -2627,7 +2662,7 @@ int main(int argc, char *argv[])
 		std::cout << "Using port: " << port << std::endl;
 		std::cout << "Thread count: " << THREAD_COUNT << std::endl;
 		std::cout << "Chunk cache lines: " << global_cache_size << std::endl;
-		std::cout << "Read limit (voxels x channels): " << (MAX_READ_VOXELS > 0 ? std::to_string(MAX_READ_VOXELS) : "none") << std::endl;
+		std::cout << "Read limit (voxels per channel): " << (MAX_READ_VOXELS > 0 ? std::to_string(MAX_READ_VOXELS) : "none") << std::endl;
 
 		app.port(port)
 			//.use_compression(crow::compression::algorithm::DEFLATE)
