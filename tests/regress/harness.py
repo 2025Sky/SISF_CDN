@@ -116,10 +116,12 @@ class Server:
     def remove(self):
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
 
-    def request(self, method, path, body=None, timeout=120):
+    def request(self, method, path, body=None, timeout=120, before_restart=None):
         """Returns (status, body bytes). status is 'CRASH' if the server died,
         'TIMEOUT' if it is alive but did not answer within timeout seconds,
-        'NOCONN' if it is alive but the connection failed otherwise."""
+        'NOCONN' if it is alive but the connection failed otherwise.
+        before_restart runs after a crash and before the restart, e.g. to
+        remove a dataset that would kill the restarted server's startup scan."""
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=body, method=method)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -131,6 +133,8 @@ class Server:
             alive, code = self.running()
             if not alive:
                 tail = self.logs_tail()
+                if before_restart is not None:
+                    before_restart()
                 self.restart()
                 return "CRASH", f"exit={code}; {' | '.join(tail[-4:])}; {type(e).__name__}"
             if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
@@ -414,17 +418,30 @@ def sc_read_failure_before_patch(server, results, sid):
     container and back). Production answers that read with zeros for the
     mchunk, and the PATCH writes them over its labels, 200 both times. The
     portal's read carries its token; a viewer's does not."""
-    ds, size, mchunk, seed = "sc_strict", (96, 64, 32), (64, 64, 32), 7
+    _read_failure_before_patch(server, results, sid, "sc_strict", "data")
+
+
+def sc_cold_meta_before_patch(server, results, sid):
+    """The same sequence with mchunk (0,0,0)'s .meta unreadable instead, on
+    a server that has never opened that mchunk: no reader can be built for
+    it during the read, so it reads as if the mchunk were missing, and the
+    PATCH, which finds the .meta again, writes the zeros over its labels on
+    production."""
+    _read_failure_before_patch(server, results, sid, "sc_cold", "meta")
+
+
+def _read_failure_before_patch(server, results, sid, ds, ext):
+    size, mchunk, seed = (96, 64, 32), (64, 64, 32), 7
     root = os.path.join(server.data_dir, ds)
     fixtures.segmentation(root, size, mchunk, RES, prefill_seed=seed)
     server.snapshot(ds)
     b, shape = box(0, 96, 0, 64, 0, 32), (32, 64, 96)  # the portal's clamped super-chunk
-    data = f"/data/{ds}/data/chunk_0_0_0.0.1X.data"
-    server.exec("mv", data, data + ".away")
+    path = f"/data/{ds}/{ext}/chunk_0_0_0.0.1X.{ext}"
+    server.exec("mv", path, path + ".away")
     results[f"{sid}: viewer read (no token)"] = digest(*server.request("GET", f"/{ds}/1/{b}"))
     st, cur = server.request("GET", f"/{ds}+token={fixtures.TOKEN}/1/{b}")
     results[f"{sid}: portal read before the PATCH"] = digest(st, cur)
-    server.exec("mv", data + ".away", data)
+    server.exec("mv", path + ".away", path)
     if st == 200:
         # The portal only goes on after a 200. A stroke in mchunk (1,0,0),
         # painted where nothing is stored yet (protect_existing).
@@ -498,6 +515,68 @@ def sc_regrown_tile(server, results, sid):
     results[f"{sid}: writable copy: read the box back"] = digest(*server.request("GET", f"/{dsw}/1/{b}"))
 
 
+def sc_short_video_frame(server, results, sid):
+    """An mchunk header that names video compression (type 2) over zstd
+    frames shorter than the video header decode_stack_native reads (13
+    uint32 fields and a uint64). A constant chunk compresses to about 20
+    bytes. Read by a viewer, by the portal (token) and under a PATCH of part
+    of a chunk; production reads past the frame and dies each time."""
+    ds = "sc_video"
+    root = os.path.join(server.data_dir, ds)
+    fixtures.write_metadata(root, 1, (64, 64, 32), RES, (64, 64, 32))
+    name = "chunk_0_0_0.0.1X"
+    fixtures.create_shard(f"{root}/data/{name}.data", f"{root}/meta/{name}.meta",
+                          np.full((64, 64, 32), 5, dtype=np.uint16), (32, 32, 32))
+    with open(f"{root}/.sisf_access", "w") as f:
+        f.write(fixtures.TOKEN + "\n")
+    with open(f"{root}/meta/{name}.meta", "r+b") as f:
+        f.seek(86)
+        sizes = [struct.unpack(fixtures.SHARD_LINE_LAYOUT, f.read(12))[1] for _ in range(4)]  # 2x2x1 chunks
+        if max(sizes) >= 60:
+            raise RuntimeError(f"{sid}: a frame is not shorter than the video header: {sizes}")
+        f.seek(6)  # version, dtype, channels, compression
+        f.write(struct.pack("<H", 2))
+    server.snapshot(ds)
+    b = box(0, 64, 0, 64, 0, 32)
+    results[f"{sid}: viewer read"] = digest(*server.request("GET", f"/{ds}/1/{b}"))
+    results[f"{sid}: portal read"] = digest(*server.request("GET", f"/{ds}+token={fixtures.TOKEN}/1/{b}"))
+    results[f"{sid}: PATCH part of a chunk"] = digest(*server.request(
+        "PATCH", f"/{ds}+token={fixtures.TOKEN}/write/1/" + box(8, 24, 8, 24, 0, 16),
+        np.full(16 * 16 * 16, 3, dtype=np.uint16).tobytes()))
+
+
+def _unloadable_dataset(server, results, sid, ds, damage):
+    """A dataset whose metadata.bin cannot give an mchunk size. Its first
+    request runs the inventory scan, which divides by the mchunk size; on
+    production (amd64) that is SIGFPE, and every restart dies in the same
+    scan while the file is there, so it is removed before the restart and
+    after the request."""
+    root = os.path.join(server.data_dir, ds)
+    _vol(root)
+    damage(os.path.join(root, "metadata.bin"))
+    remove = lambda: shutil.rmtree(root, ignore_errors=True)
+    results[f"{sid}: /info"] = digest(*server.request("GET", f"/{ds}/info", before_restart=remove))
+    remove()
+
+
+def sc_empty_metadata(server, results, sid):
+    """A 0-byte metadata.bin, as between the converter's open('wb') and its
+    write, or after a conversion killed there. Production's mchunk size is
+    whatever the heap held, so it dies only when that is 0."""
+    _unloadable_dataset(server, results, sid, "sc_meta_empty", lambda p: open(p, "wb").close())
+
+
+def _zero_mchunk_x(path):
+    with open(path, "r+b") as f:
+        f.seek(6)  # version, dtype, channels, then mchunk x
+        f.write(struct.pack("<H", 0))
+
+
+def sc_zero_mchunk_size(server, results, sid):
+    """A complete metadata.bin whose mchunk x size is 0."""
+    _unloadable_dataset(server, results, sid, "sc_meta_zero", _zero_mchunk_x)
+
+
 def sc_raw_access_outside(server, results, sid):
     """raw_access over a range wider than the mchunk's stored tile (vol1c's
     mchunk (0,0,0) is 64 px wide). Production reads past the chunk buffer."""
@@ -515,10 +594,15 @@ SCENARIOS = [
     ("s4 missing .data", sc_missing_data),
     ("s5 unreadable chunk under a PATCH", sc_unreadable_chunk_write),
     ("s6 read failure before a PATCH", sc_read_failure_before_patch),
+    ("s9 cold .meta before a PATCH", sc_cold_meta_before_patch),
+    ("s10 short video frame", sc_short_video_frame),
+    ("s11 empty metadata.bin", sc_empty_metadata),
+    ("s12 zero mchunk size", sc_zero_mchunk_size),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
-SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short", "sc_strict", "sc_regrow", "sc_regrow_w"]
+SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short", "sc_strict", "sc_regrow", "sc_regrow_w",
+                     "sc_cold", "sc_video"]
 
 
 def run_scenarios(server, results):

@@ -37,7 +37,16 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
   - s7: a tile re-converted in place with a wider tile while the server
     holds readers for it, then read and written in the one chunk whose
     extent grew; it runs last because production dies in it;
-  - s8: a `raw_access` read wider than the mchunk's stored tile.
+  - s8: a `raw_access` read wider than the mchunk's stored tile;
+  - s9: s6's sequence with the `.meta` unreadable instead, on an mchunk the
+    server has never opened, so no reader can be built for it during the
+    read;
+  - s10: an mchunk header naming video compression over zstd frames shorter
+    than the video header, read by a viewer and by the portal and under a
+    PATCH;
+  - s11, s12: a dataset whose `metadata.bin` is empty, or names an mchunk
+    size of 0 (production divides by it in the inventory scan; the harness
+    removes the dataset before restarting a server that died on it).
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
