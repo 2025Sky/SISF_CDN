@@ -17,7 +17,9 @@ RUN cd x264; make -j $BUILD_THREAD; cd ..
 RUN cd zstd; make -j $BUILD_THREAD; cd ..
 RUN cd ffmpeg_HDF5_filter; cmake .; make -j $BUILD_THREAD; cd ..
 
-RUN cmake .; exit 0
+# SANITIZE=ON builds the server with ASan + UBSan (see CMakeLists.txt).
+ARG SANITIZE=OFF
+RUN cmake -DNTRACER_SANITIZE=$SANITIZE .; exit 0
 RUN make -j $BUILD_THREAD
 
 # Runtime image: only the binary, the two in-tree shared libraries it loads

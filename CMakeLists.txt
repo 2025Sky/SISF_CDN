@@ -39,6 +39,16 @@ target_include_directories(nTracer_cdn PRIVATE "/usr/include/hdf5/serial/")
 
 target_compile_options(nTracer_cdn PUBLIC -O3 -march=native -Wl,--no-as-needed -ldl)
 
+# AddressSanitizer + UBSan for this target only (tensorstore and grpc stay
+# uninstrumented). The runtimes are linked statically so the slim runtime
+# image needs no extra packages.
+option(NTRACER_SANITIZE "Build nTracer_cdn with -fsanitize=address,undefined" OFF)
+if(NTRACER_SANITIZE)
+  target_sources(nTracer_cdn PRIVATE src/sanitizer_options.cpp)
+  target_compile_options(nTracer_cdn PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer -g)
+  target_link_options(nTracer_cdn PRIVATE -fsanitize=address,undefined -static-libasan -static-libubsan)
+endif()
+
 
 FetchContent_Declare(
   tensorstore
