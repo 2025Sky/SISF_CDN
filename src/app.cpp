@@ -2270,17 +2270,23 @@ int main(int argc, char *argv[])
 
 		// The portal sends its token on the read before every PATCH, whose
 		// answer it merges and writes back, and on its algorithm reads;
-		// viewers send none. Such a read fails with 500 when a chunk could
-		// not be read, instead of answering zeros for it that the portal
-		// would then write over the stored labels. That includes an mchunk
-		// with no usable .meta: a writable layer has one for every mchunk,
-		// and the PATCH that follows refuses a missing mchunk anyway.
+		// viewers send none. On a writable (protected) layer such a read
+		// fails with 500 when a chunk could not be read, instead of answering
+		// zeros for it that the portal would then write over the stored
+		// labels. That includes an mchunk with no usable .meta: a writable
+		// layer has one for every mchunk, and the PATCH that follows refuses
+		// a missing mchunk anyway. Unprotected datasets (converted images)
+		// keep answering zeros, since their coarse levels legitimately lack
+		// some mchunks.
 		bool strict_read = false;
-		for (const auto &pair : filters)
+		if (reader->is_protected)
 		{
-			if (pair.first == "token")
+			for (const auto &pair : filters)
 			{
-				strict_read = true;
+				if (pair.first == "token")
+				{
+					strict_read = true;
+				}
 			}
 		}
 		bool read_failed = false;
