@@ -72,6 +72,35 @@ std::string read_too_large(size_t x, size_t y, size_t z)
 		   " voxels per channel; read a smaller box\n";
 }
 
+// How many items of a data id's filter list (the text after its first '+',
+// items split at '&' or '+') are named name, parsed or not. parse_filter_list
+// drops an item that is not exactly name=value (e.g. "channel=" or
+// "channel=1=2"), and every item when the id has a second '+'.
+size_t count_filter_items(const std::string &data_id_in, const std::string &name)
+{
+	size_t start = data_id_in.find('+');
+	if (start == std::string::npos)
+	{
+		return 0;
+	}
+	size_t n = 0;
+	while (start != std::string::npos)
+	{
+		start++;
+		const size_t stop = data_id_in.find_first_of("&+", start);
+		std::string key = data_id_in.substr(start, stop == std::string::npos ? std::string::npos : stop - start);
+		key = key.substr(0, key.find('='));
+		std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c)
+					   { return std::tolower(c); });
+		if (key == name)
+		{
+			n++;
+		}
+		start = stop;
+	}
+	return n;
+}
+
 // skeleton_api's upload, replace and delete change traces.sql without any
 // token check (delete is a GET), so they are off unless SKELETON_API_WRITES=1.
 // ls and get are not affected.
@@ -2336,22 +2365,35 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		// +channel=N returns channel N only; without it, every channel
+		// +channel=N returns channel N only; without it, every channel. A
+		// channel item parse_filter_list dropped (no value, as in "+channel=",
+		// two '=', or a second '+' in the id) is invalid too: answering with
+		// every channel would hand a client that asked for one the wrong layout.
 		int64_t channel = -1;
+		bool channel_valid = true;
+		size_t channel_items = 0;
 		for (const auto &pair : filters)
 		{
 			if (pair.first == "channel")
 			{
+				channel_items++;
 				size_t n = 0;
 				if (!parse_decimal(pair.second, n) || n >= reader->channel_count)
 				{
-					res.code = crow::status::BAD_REQUEST;
-					res.end("400 Bad Request -- Invalid channel: this dataset has channels 0 to " +
-							std::to_string(reader->channel_count - 1) + "\n");
-					return;
+					channel_valid = false;
 				}
-				channel = (int64_t)n;
+				else
+				{
+					channel = (int64_t)n;
+				}
 			}
+		}
+		if (!channel_valid || channel_items != count_filter_items(data_id_in, "channel"))
+		{
+			res.code = crow::status::BAD_REQUEST;
+			res.end("400 Bad Request -- Invalid channel: this dataset has channels 0 to " +
+					std::to_string(reader->channel_count - 1) + "\n");
+			return;
 		}
 		const size_t channels_out = channel < 0 ? reader->channel_count : 1;
 

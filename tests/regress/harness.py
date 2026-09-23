@@ -656,9 +656,9 @@ def sc_channel_filter(server, results, sid):
     """+channel=N returns channel N only. Each such read must equal channel
     N of the same read without the filter (a box, a plane, a neuroglancer
     chunk, a coarser level, a projection and a gaussian filter, which works
-    per channel); a channel the dataset does not have, or one that is not a
-    whole number, answers 400. Production ignores the filter and returns
-    every channel."""
+    per channel); a channel the dataset does not have, one that is not a
+    whole number, or a channel item that cannot be parsed answers 400.
+    Production ignores the filter and returns every channel."""
     cases = [
         ("box", "", 1, box(0, 70, 0, 60, 0, 20)),
         ("plane", "", 1, box(3, 67, 5, 55, 10, 11)),
@@ -683,6 +683,11 @@ def sc_channel_filter(server, results, sid):
         results[f"{sid}: vol3c channel {bad}"] = digest(*server.request(
             "GET", f"/vol3c+channel={bad}/1/" + box(0, 8, 0, 8, 0, 1)))
     results[f"{sid}: vol1c channel 1"] = digest(*server.request("GET", "/vol1c+channel=1/1/" + box(0, 8, 0, 8, 0, 1)))
+    # Items parse_filter_list drops: no value, no '=', two '=', and a second
+    # '+' in the id (which drops every item)
+    for tag, item in (("empty value", "channel="), ("no value", "channel"), ("two values", "channel=1=2"),
+                      ("second +", "channel=1+offset=0")):
+        results[f"{sid}: vol3c {tag}"] = digest(*server.request("GET", f"/vol3c+{item}/1/" + box(0, 8, 0, 8, 0, 1)))
 
 
 def sc_read_limit(server, results, sid):

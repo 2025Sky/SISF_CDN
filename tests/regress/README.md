@@ -69,8 +69,9 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
     file's bytes are not compared; each server records whether it changed;
   - s13: `+channel=N` reads of the 3-channel fixture, each checked against
     channel N's block of the same read without the filter (boxes, a plane,
-    a coarser level, a projection, a gaussian filter), and channels that do
-    not exist;
+    a coarser level, a projection, a gaussian filter), channels that do
+    not exist, and channel items that cannot be parsed (`+channel=`,
+    `+channel`, two `=`, a second `+`);
   - s14: a second server on the same data started with `MAX_READ_VOXELS`
     set (a box, per channel): image reads under, at and over the limit on
     the 3-channel and the 1-channel fixture, a projection at and over it, a
