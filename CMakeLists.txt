@@ -37,7 +37,17 @@ cmake_print_variables(CAI_FFMPEG_LIB)
 
 target_include_directories(nTracer_cdn PRIVATE "/usr/include/hdf5/serial/")
 
-target_compile_options(nTracer_cdn PUBLIC -O3 -march=native -Wl,--no-as-needed -ldl)
+# -march=native tied the binary to whichever CPU built it; CI runners vary
+# (AMD Zen 3 on one run, Intel Sapphire Rapids on the next), and a binary
+# built for the latter may use instructions the production host lacks.
+# x86-64-v3 (AVX2) runs on every current runner and on the production host.
+# Other architectures (local arm64 builds) keep native.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  set(NTRACER_MARCH "x86-64-v3" CACHE STRING "Target CPU for nTracer_cdn")
+else()
+  set(NTRACER_MARCH "native" CACHE STRING "Target CPU for nTracer_cdn")
+endif()
+target_compile_options(nTracer_cdn PUBLIC -O3 -march=${NTRACER_MARCH} -Wl,--no-as-needed -ldl)
 
 
 FetchContent_Declare(
