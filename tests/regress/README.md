@@ -92,6 +92,19 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
 - Each server's full log is saved to `<work>/<role>.log`, and s18's other
   servers' to `<work>/<role>-skeleton-<value>.log`.
 
+`--candidate-env KEY=VALUE` (repeatable) starts the candidate with that
+environment variable, e.g. `CHUNK_CACHE_LINES=4096` to check that a larger
+chunk cache changes no answer.
+
+`stress_d6.py` is not part of the gate. It stresses the stale cache
+re-insert (a read that decoded a chunk while a PATCH replaced it putting
+the old chunk back into the cache), which sits between two points inside
+the server and cannot be triggered on demand from outside: reader
+processes read one chunk without pause while a writer PATCHes it, and
+after each PATCH the chunk is read again. A run that finds no stale read
+means something only if the same settings find some on a build without
+the fix.
+
 Compare like with like: run both images on amd64. An integer division by zero
 that kills the process on x86-64 returns 0 on arm64, so an arm64 candidate can
 pass a case that crashes in production.

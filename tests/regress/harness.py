@@ -3,6 +3,7 @@ both the same requests, and report every response that differs.
 
     python harness.py --baseline IMAGE --candidate IMAGE --work DIR
                       [--baseline-platform linux/amd64] [--candidate-platform ...]
+                      [--candidate-env KEY=VALUE ...]
                       [--allow expected_diffs.json] [--report report.json]
 
 Reads are compared by status code and SHA-256 of the body. Writes are sent to
@@ -1156,7 +1157,15 @@ def main():
     ap.add_argument("--allow")
     ap.add_argument("--report")
     ap.add_argument("--skip-danger", action="store_true")
+    ap.add_argument("--candidate-env", action="append", default=[], metavar="KEY=VALUE",
+                    help="environment variable for the candidate server, e.g. CHUNK_CACHE_LINES=4096; repeatable")
     args = ap.parse_args()
+    candidate_env = {}
+    for kv in args.candidate_env:
+        key, sep, value = kv.partition("=")
+        if not sep or not key:
+            ap.error(f"--candidate-env takes KEY=VALUE, not {kv!r}")
+        candidate_env[key] = value
 
     allow = {}
     if args.allow:
@@ -1167,14 +1176,14 @@ def main():
     shutil.rmtree(work, ignore_errors=True)
     fixtures.main(os.path.join(work, "fixtures"))
     servers = []
-    for role, image, plat in (("baseline", args.baseline, args.baseline_platform),
-                              ("candidate", args.candidate, args.candidate_platform)):
+    for role, image, plat, env in (("baseline", args.baseline, args.baseline_platform, {}),
+                                   ("candidate", args.candidate, args.candidate_platform, candidate_env)):
         d = os.path.join(work, role)
         shutil.copytree(os.path.join(work, "fixtures"), d)
-        servers.append(Server(role, image, plat, d))
+        servers.append(Server(role, image, plat, d, env))
 
-    report = {"baseline": args.baseline, "candidate": args.candidate, "diffs": [], "counts": {}, "results": {},
-              "crashes": [], "timeouts": []}
+    report = {"baseline": args.baseline, "candidate": args.candidate, "candidate_env": candidate_env, "diffs": [],
+              "counts": {}, "results": {}, "crashes": [], "timeouts": []}
     try:
         for s in servers:
             s.start()
