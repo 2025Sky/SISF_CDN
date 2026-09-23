@@ -10765,6 +10765,14 @@ namespace crow // NOTE: Already documented in "crow/app.h"
                   [this, p, &is, service_idx](error_code ec) {
                       if (!ec)
                       {
+                          // Send every write as soon as it is made. With Nagle's
+                          // algorithm on, the short last segment of a response
+                          // waits until the client acknowledges the previous one,
+                          // and a client that delays its acknowledgements (up to
+                          // 40 ms on Linux) stalls on a reused connection. A
+                          // failure here only leaves Nagle on.
+                          error_code nodelay_ec;
+                          p->socket().set_option(asio::ip::tcp::no_delay(true), nodelay_ec);
                           is.post(
                             [p] {
                                 p->start();
