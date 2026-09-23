@@ -380,7 +380,7 @@ public:
         return out;
     }
 
-    void replace_meta_entry(size_t id, metadata_entry *new_entry)
+    bool replace_meta_entry(size_t id, metadata_entry *new_entry)
     {
         const size_t offset = header_size + (entry_file_line_size * id);
 
@@ -398,8 +398,16 @@ public:
             file.write((char *)&(new_entry->offset), sizeof(uint64_t));
             file.write((char *)&(new_entry->size), sizeof(uint32_t));
             file.close();
-            break;
+
+            if (file.fail())
+            {
+                std::cerr << "Metadata entry write failed: " << meta_fname << " chunk " << id << std::endl;
+                return false;
+            }
+            return true;
         }
+
+        return false;
     }
 
     std::mutex chunk_cache_mutex;
@@ -634,22 +642,30 @@ public:
         return out;
     }
 
-    void overwrite_chunk(size_t id, uint16_t *data, size_t data_size)
+    // Returns false if the chunk may not be on disk as requested
+    bool overwrite_chunk(size_t id, uint16_t *data, size_t data_size)
     {
         // compress data using ZSTD
         size_t compressed_size = ZSTD_compressBound(data_size);
         void *compressed_data = malloc(compressed_size);
+        if (compressed_data == NULL)
+        {
+            std::cerr << "Chunk write failed (out of memory): " << data_fname << " chunk " << id << std::endl;
+            return false;
+        }
 
         compressed_size = ZSTD_compress(compressed_data, compressed_size, data, data_size, 5);
         if (ZSTD_isError(compressed_size))
         {
             std::cerr << "ZSTD_compress failed" << std::endl;
             free(compressed_data);
-            return;
+            return false;
         }
 
+        bool entry_written;
         {
-            global_chunk_cache_mutex.lock();
+            // Released on every return and if anything below throws
+            std::lock_guard<std::timed_mutex> lock(global_chunk_cache_mutex);
 
             // Write to file
             std::fstream file(data_fname, std::ios::in | std::ios::out | std::ios::binary);
@@ -657,7 +673,7 @@ public:
             {
                 std::cerr << "Fopen failed (write)" << std::endl;
                 free(compressed_data);
-                return;
+                return false;
             }
 
             file.seekp(0, std::ios::end);
@@ -666,12 +682,19 @@ public:
             file.write((char *)compressed_data, compressed_size);
             file.close();
 
-            metadata_entry *new_entry = (metadata_entry *)malloc(sizeof(metadata_entry));
-            new_entry->offset = new_offset;
-            new_entry->size = compressed_size;
+            // Never point the entry at bytes that did not reach the file
+            if (new_offset == (size_t)-1 || file.fail())
+            {
+                std::cerr << "Chunk append failed: " << data_fname << " chunk " << id << std::endl;
+                free(compressed_data);
+                return false;
+            }
 
-            replace_meta_entry(id, new_entry);
-            free(new_entry);
+            metadata_entry new_entry;
+            new_entry.offset = new_offset;
+            new_entry.size = compressed_size;
+
+            entry_written = replace_meta_entry(id, &new_entry);
 
             // Update cached mtime so our own write is not detected as
             // an external modification on the next read.
@@ -692,11 +715,10 @@ public:
                     }
                 }
             }
-
-            global_chunk_cache_mutex.unlock();
         }
 
         free(compressed_data);
+        return entry_written;
     }
 
     uint16_t read_pixel(size_t i, size_t j, size_t k)
@@ -1752,12 +1774,15 @@ public:
         return out_buffer;
     }
 
-    void replace_region(
+    // Returns false with a short reason in error when the write was refused
+    // (nothing written) or when writing a chunk failed.
+    bool replace_region(
         size_t scale,
         size_t xs, size_t xe,
         size_t ys, size_t ye,
         size_t zs, size_t ze,
-        const char *data)
+        const char *data,
+        std::string &error)
     {
         // Calculate size of output
         const size_t osizex = xe - xs;
@@ -1786,6 +1811,23 @@ public:
         size_t cxmin, cxmax, cxsize;
         size_t cymin, cymax, cysize;
         size_t czmin, czmax, czsize;
+
+        // Nothing has been written when this runs: the first loop edits copies only
+        auto reject = [&](const char *reason, const std::string &where) -> bool
+        {
+            std::cerr << "Write refused (" << reason << "): " << fname << ' ' << where
+                      << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze << std::endl;
+            for (auto it = chunk_cache.begin(); it != chunk_cache.end(); it++)
+            {
+                free(it->second);
+            }
+            if (chunk_identifier != nullptr)
+            {
+                delete chunk_identifier;
+            }
+            error = reason;
+            return false;
+        };
 
         for (size_t c = 0; c < channel_count; c++)
         {
@@ -1824,6 +1866,11 @@ public:
                             force = true;
                             chunk_reader = get_mchunk(scale, c, chunk_id_x, chunk_id_y, chunk_id_z);
 
+                            if (chunk_reader == nullptr)
+                            {
+                                return reject("Missing mchunk", "mchunk " + std::to_string(chunk_id_x) + '_' + std::to_string(chunk_id_y) + '_' + std::to_string(chunk_id_z) + " channel " + std::to_string(c));
+                            }
+
                             last_x = chunk_id_x;
                             last_y = chunk_id_y;
                             last_z = chunk_id_z;
@@ -1833,6 +1880,13 @@ public:
                         const size_t x_in_chunk_offset = x_in_chunk + chunk_reader->cropstartx;
                         const size_t y_in_chunk_offset = y_in_chunk + chunk_reader->cropstarty;
                         const size_t z_in_chunk_offset = z_in_chunk + chunk_reader->cropstartz;
+
+                        if (x_in_chunk_offset >= chunk_reader->sizex ||
+                            y_in_chunk_offset >= chunk_reader->sizey ||
+                            z_in_chunk_offset >= chunk_reader->sizez)
+                        {
+                            return reject("Region outside stored tile", chunk_reader->meta_fname);
+                        }
 
                         // Find sub chunk id from coordinates
                         sub_chunk_id = chunk_reader->find_index(x_in_chunk_offset, y_in_chunk_offset, z_in_chunk_offset);
@@ -1861,11 +1915,24 @@ public:
                             czmax = std::min((size_t)czmin + chunk_reader->chunkz, (size_t)chunk_reader->sizez);
                             czsize = czmax - czmin;
 
+                            if (cxmax <= cxmin || cymax <= cymin || czmax <= czmin)
+                            {
+                                return reject("Region outside stored tile", chunk_reader->meta_fname);
+                            }
+
                             // Check if the chunk is in the tmp cache
                             chunk = chunk_cache[*chunk_identifier];
                             if (chunk == 0)
                             {
-                                chunk = chunk_reader->load_chunk(sub_chunk_id, cxsize, cysize, czsize);
+                                // Writing back a chunk that failed to load would replace its
+                                // voxels outside this region with zeros
+                                bool load_failed = false;
+                                chunk = chunk_reader->load_chunk(sub_chunk_id, cxsize, cysize, czsize, &load_failed);
+                                if (chunk == nullptr || load_failed)
+                                {
+                                    free(chunk);
+                                    return reject("Could not read existing chunk", chunk_reader->data_fname + " chunk " + std::to_string(sub_chunk_id));
+                                }
                                 chunk_cache[*chunk_identifier] = chunk;
 
                                 chunk_sizes[chunk] = std::make_tuple(cxsize, cysize, czsize);
@@ -1899,6 +1966,7 @@ public:
         }
 
         // TODO load chunks back
+        bool all_written = true;
         for (auto it = chunk_cache.begin(); it != chunk_cache.end(); it++)
         {
             std::tuple<size_t, size_t, size_t, size_t, size_t> id_tuple = it->first;
@@ -1910,15 +1978,27 @@ public:
 
             if (chunk_writer == nullptr)
             {
+                all_written = false;
                 free(it->second);
                 continue;
             }
 
             size_t chunk_size = std::get<0>(chunk_sizes[it->second]) * std::get<1>(chunk_sizes[it->second]) * std::get<2>(chunk_sizes[it->second]) * sizeof(uint16_t);
 
-            chunk_writer->overwrite_chunk(std::get<4>(id_tuple), it->second, chunk_size);
+            if (!chunk_writer->overwrite_chunk(std::get<4>(id_tuple), it->second, chunk_size))
+            {
+                all_written = false;
+            }
             free(it->second);
         }
+
+        if (!all_written)
+        {
+            // The other chunks of the request may have been written
+            std::cerr << "Write failed: " << fname << " box " << xs << '-' << xe << '_' << ys << '-' << ye << '_' << zs << '-' << ze << std::endl;
+            error = "Could not write chunk";
+        }
+        return all_written;
     }
 
     void print_info()

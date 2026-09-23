@@ -858,9 +858,15 @@ int main(int argc, char *argv[])
 			return;
 		}
 
-		reader->replace_region(
-			1, x_begin, x_end, y_begin, y_end, z_begin, z_end, insert.c_str()
-		);
+		std::string write_error;
+		if (!reader->replace_region(
+			1, x_begin, x_end, y_begin, y_end, z_begin, z_end, insert.c_str(), write_error
+		))
+		{
+			res.code = crow::status::INTERNAL_SERVER_ERROR;
+			res.end("500 Internal Server Error -- " + write_error + "\n");
+			return;
+		}
 
 		res.code = crow::status::OK;
 		res.body = "done.";
