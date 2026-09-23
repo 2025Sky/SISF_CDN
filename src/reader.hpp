@@ -666,6 +666,14 @@ public:
             case 2:
             case 3:
             {
+                // decode_stack_native reads a fixed header (13 uint32 fields and
+                // a uint64 size) without checking the buffer's length
+                if (sel->size < 13 * sizeof(uint32_t) + sizeof(uint64_t))
+                {
+                    decode_error = "video frame shorter than its header";
+                    break;
+                }
+
                 // Decompress with vidlib 2
                 // read_decomp_buffer_pt = decode_stack_AV1(sizex, sizey, sizez, read_buffer, sel->size);
                 auto decode_result = decode_stack_native(read_buffer, sel->size);
