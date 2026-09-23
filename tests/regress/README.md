@@ -28,10 +28,16 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
   whose data is cut short (production overwrites the chunk's other voxels
   with zeros and answers 200).
 - `expected_diffs.json` lists the differences that are intended, each with a
-  reason. Anything else fails the run, and so does any candidate CRASH or
-  TIMEOUT, even where the baseline crashes the same way, and so does a listed
+  reason and, under `expect`, the candidate's answer: any of `status`,
+  `len`, `sha256`, `text` for a response, `sha256` for a file, or
+  `"unchanged"` for a file that must still equal the dataset as built. An
+  entry without `expect` is allowed only where the candidate's answer
+  legitimately varies, and its reason must say why; the run lists such
+  entries. Anything not listed fails the run, and so does any candidate
+  CRASH or TIMEOUT (even where the baseline crashes the same way), a listed
   difference that did not occur (the candidate behaves like the baseline
-  there again).
+  there again), and a listed difference where the candidate's answer is not
+  the expected one.
 - Each server's full log is saved to `<work>/<role>.log`.
 
 Compare like with like: run both images on amd64. An integer division by zero

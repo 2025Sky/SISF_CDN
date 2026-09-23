@@ -13,11 +13,12 @@ CRASH for that request, restarted, and the run continues; one that stays up
 but does not answer in time is recorded as TIMEOUT.
 
 Exit status: 0 when every difference is listed in the allow file, every
-difference the allow file lists actually occurred, and the candidate never
-crashed or timed out; 1 otherwise. A candidate crash fails the run even where
-the baseline crashes too, because two crashes compare as equal, and a listed
-difference that did not occur means the candidate behaves like the baseline
-there again.
+difference the allow file lists actually occurred, every listed difference
+whose entry names the candidate's expected answer got that answer, and the
+candidate never crashed or timed out; 1 otherwise. A candidate crash fails the
+run even where the baseline crashes too, because two crashes compare as equal,
+and a listed difference that did not occur means the candidate behaves like
+the baseline there again.
 """
 
 import argparse
@@ -49,6 +50,16 @@ class Server:
         self.role, self.image, self.platform, self.data_dir = role, image, platform, data_dir
         self.name = f"cdn-regress-{role}-{os.getpid()}"
         self.port = None
+        # SHA-256 of each file of a scenario dataset as built, before any
+        # request, keyed like disk_hashes(); "unchanged" in the allow file
+        # compares against these
+        self.fixture_hashes = {}
+
+    def snapshot(self, ds):
+        for dirpath, _, files in os.walk(os.path.join(self.data_dir, ds)):
+            for f in files:
+                path = os.path.join(dirpath, f)
+                self.fixture_hashes[os.path.relpath(path, self.data_dir)] = file_sha(path)
 
     def start(self):
         cmd = ["docker", "run", "-d", "--name", self.name, "-p", "127.0.0.1::6000",
@@ -120,6 +131,11 @@ class Server:
             if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
                 return "TIMEOUT", f"no response within {timeout} s"
             return "NOCONN", f"{type(e).__name__}: {e}"
+
+
+def file_sha(path):
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
 
 
 def digest(status, body):
@@ -362,6 +378,7 @@ def sc_unreadable_chunk_write(server, results, sid):
         offset, size = struct.unpack(fixtures.SHARD_LINE_LAYOUT, f.read(12))
     with open(os.path.join(root, "data", "chunk_0_0_0.0.1X.data"), "r+b") as f:
         f.truncate(offset + size // 2)
+    server.snapshot(ds)
     body = np.full(16 * 16 * 16, 3, dtype=np.uint16).tobytes()
     results[f"{sid}: PATCH part of the chunk"] = digest(*server.request(
         "PATCH", f"/{ds}+token={fixtures.TOKEN}/write/1/" + box(40, 56, 40, 56, 0, 16), body))
@@ -405,8 +422,7 @@ def disk_hashes(root):
         for dirpath, _, files in os.walk(os.path.join(root, ds)):
             for f in files:
                 path = os.path.join(dirpath, f)
-                with open(path, "rb") as fh:
-                    out[os.path.relpath(path, root)] = hashlib.sha256(fh.read()).hexdigest()
+                out[os.path.relpath(path, root)] = file_sha(path)
     return out
 
 
@@ -430,7 +446,7 @@ def compare(a, b, allow):
         same = both_crashed or (x is not None and y is not None and x["status"] == y["status"]
                                 and x["sha256"] == y["sha256"] and (x["sha256"] is not None or x["text"] == y["text"]))
         if not same:
-            diffs.append({"id": k, "baseline": x, "candidate": y, "allowed": allow.get(k)})
+            diffs.append({"id": k, "baseline": x, "candidate": y, "allowed": allow[k]["reason"] if k in allow else None})
     return diffs
 
 
@@ -449,7 +465,7 @@ def main():
     allow = {}
     if args.allow:
         with open(args.allow) as f:
-            allow = {e["id"]: e["reason"] for e in json.load(f)}
+            allow = {e["id"]: e for e in json.load(f)}
 
     work = os.path.abspath(args.work)
     shutil.rmtree(work, ignore_errors=True)
@@ -516,7 +532,7 @@ def main():
     ha, hb = disk_hashes(servers[0].data_dir), disk_hashes(servers[1].data_dir)
     disk = [{"id": f"disk {k}", "baseline": {"status": "file", "sha256": ha.get(k), "len": None, "text": None},
              "candidate": {"status": "file", "sha256": hb.get(k), "len": None, "text": None},
-             "allowed": allow.get(f"disk {k}"), "stage": "disk"}
+             "allowed": allow[f"disk {k}"]["reason"] if f"disk {k}" in allow else None, "stage": "disk"}
             for k in sorted(set(ha) | set(hb)) if ha.get(k) != hb.get(k)]
     report["counts"]["disk"] = {"files": len(set(ha) | set(hb)), "diffs": len(disk)}
     report["diffs"] += disk
@@ -531,6 +547,30 @@ def main():
     seen = {d["id"] for d in report["diffs"]}
     not_seen = sorted(k for k in allow if k not in seen)
     report["expected_not_seen"] = not_seen
+    # A listed difference must also be the one intended: where the entry
+    # names the candidate's answer ("expect"), the candidate must give it.
+    # "unchanged" means a file equal to the dataset as built.
+    mismatched, not_pinned = [], []
+    for d in report["diffs"]:
+        entry = allow.get(d["id"])
+        if entry is None:
+            continue
+        want, got = entry.get("expect"), d["candidate"] or {}
+        if want is None:
+            not_pinned.append(d["id"])
+            continue
+        if want == "unchanged":
+            path = d["id"][len("disk "):]
+            ref = servers[1].fixture_hashes.get(path)
+            if ref is None and os.path.exists(os.path.join(work, "fixtures", path)):
+                ref = file_sha(os.path.join(work, "fixtures", path))
+            ok = d["stage"] == "disk" and ref is not None and got.get("sha256") == ref
+        else:
+            ok = all(got.get(key) == val for key, val in want.items())
+        if not ok:
+            mismatched.append({"id": d["id"], "expected": want, "candidate": got})
+    report["expected_value_mismatch"] = mismatched
+    report["not_pinned"] = not_pinned
     if args.report:
         with open(args.report, "w") as f:
             json.dump(report, f, indent=1)
@@ -542,12 +582,16 @@ def main():
     for c in report["timeouts"]:
         print(f"[TIMEOUT] {c['role']} {c['stage']}: {c['id']}\n    {c['text']}")
     for k in not_seen:
-        print(f"[EXPECTED, NOT SEEN] {k}\n    {allow[k]}")
+        print(f"[EXPECTED, NOT SEEN] {k}\n    {allow[k]['reason']}")
+    for m in mismatched:
+        print(f"[WRONG CANDIDATE ANSWER] {m['id']}\n    expected:  {m['expected']}\n    candidate: {m['candidate']}")
+    for k in not_pinned:
+        print(f"[ALLOWED WITHOUT AN EXPECTED ANSWER] {k}")
     print(f"RESULT: {len(report['diffs'])} differences, {len(unexpected)} unexpected, "
           f"{len(report['crashes'])} crashes, {len(report['timeouts'])} timeouts "
           f"(baseline and candidate counted separately); candidate crashed or timed out {len(candidate_failures)} times; "
-          f"{len(not_seen)} expected differences not seen")
-    return 1 if unexpected or candidate_failures or not_seen else 0
+          f"{len(not_seen)} expected differences not seen; {len(mismatched)} candidate answers not as expected")
+    return 1 if unexpected or candidate_failures or not_seen or mismatched else 0
 
 
 if __name__ == "__main__":
