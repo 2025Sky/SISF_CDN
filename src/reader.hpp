@@ -243,7 +243,10 @@ public:
 
     size_t this_mchunk_id;
 
-    time_t last_meta_read_time = 0;
+    // In nanoseconds: a rewrite that finishes within the second of the last
+    // check (e.g. after a reload that found the header cut short) must still
+    // count as a change
+    int64_t last_meta_read_time = 0;
 
     std::string meta_fname, data_fname;
 
@@ -268,7 +271,7 @@ public:
 
     bool check_mtime_hasmodified()
     {
-        time_t mtime = get_file_mtime(meta_fname);
+        int64_t mtime = get_file_mtime_ns(meta_fname);
 
         if (last_meta_read_time != mtime)
         {
@@ -841,7 +844,7 @@ public:
 
             // Update cached mtime so our own write is not detected as
             // an external modification on the next read.
-            last_meta_read_time = get_file_mtime(meta_fname);
+            last_meta_read_time = get_file_mtime_ns(meta_fname);
 
             // Delete the prexisting values in the cache
             for (size_t i = 0; i < global_cache_size; i++)

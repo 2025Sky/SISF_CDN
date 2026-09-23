@@ -301,7 +301,7 @@ def sc_stale_geometry(server, results, sid):
     ds, tile = "sc_stale", (96, 96, 1)
     root = os.path.join(server.data_dir, ds)
     fixtures.tiled(root, 1, (3, 2, 1), tile, (24, 24, 0), RES, 3)  # step 72
-    time.sleep(1.2)  # the CDN compares .meta mtimes in whole seconds
+    time.sleep(1.2)  # production compares .meta mtimes in whole seconds
     results[f"{sid}: /info before"] = digest(*server.request("GET", f"/{ds}/info"))
     results[f"{sid}: read before"] = digest(*server.request("GET", f"/{ds}/1/" + box(0, 216, 0, 144, 0, 1)))
     fixtures.tiled(root, 1, (3, 2, 1), tile, (32, 32, 0), RES, 3)  # in place, step 64
