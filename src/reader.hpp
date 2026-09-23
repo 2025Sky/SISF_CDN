@@ -137,6 +137,7 @@ log_limiter log_limit_chunk_decode;
 log_limiter log_limit_entry_write;
 log_limiter log_limit_write_oom;
 log_limiter log_limit_append;
+log_limiter log_limit_header;
 log_limiter log_limit_read_outside;
 log_limiter log_limit_read_refused;
 log_limiter log_limit_write_refused;
@@ -328,14 +329,25 @@ public:
         file.read((char *)&cropendz, sizeof(uint64_t));
         bytes_read += file.gcount();
 
-        header_size = file.tellg();
+        // tellg() is -1 after a short read; header_size keeps its last good value
+        const std::streamoff read_end = file.tellg();
         file.close();
 
-        if (header_size != header_size_expected || bytes_read != header_size_expected)
+        if (read_end != (std::streamoff)header_size_expected || bytes_read != header_size_expected)
         {
             std::cerr << "Metadata read failed (short read)" << std::endl;
+            // The fields above may now be half new and half old
+            mark_unusable("short read");
             return;
         }
+
+        if (chunkx == 0 || chunky == 0 || chunkz == 0)
+        {
+            mark_unusable("chunk size 0");
+            return;
+        }
+
+        header_size = read_end;
 
         countx = (sizex + ((size_t)chunkx) - 1) / ((size_t)chunkx);
         county = (sizey + ((size_t)chunky) - 1) / ((size_t)chunky);
@@ -348,6 +360,30 @@ public:
         if (reset_cache)
         {
             clear_cache_lines();
+        }
+    }
+
+    // Nothing may index this mchunk until a later reload succeeds: reads of
+    // it return zeros and writes to it are refused. A reader built this way
+    // is dropped by get_mchunk, as one whose .meta cannot be opened is.
+    void mark_unusable(const char *reason)
+    {
+        is_valid = false;
+
+        std::string note;
+        if (log_limit_header.allow(note))
+        {
+            std::cerr << "Mchunk header unusable (" << reason << "): " << meta_fname << note << std::endl;
+        }
+    }
+
+    // Re-reads the header if the .meta changed on disk since it was last read
+    void reload_if_modified()
+    {
+        if (check_mtime_hasmodified())
+        {
+            std::cerr << "Metadata file modified on disk for " << meta_fname << ", reloading metadata" << std::endl;
+            reload_metadata();
         }
     }
 
@@ -387,10 +423,12 @@ public:
                 continue;
             }
 
-            if (check_mtime_hasmodified())
+            reload_if_modified();
+
+            if (!is_valid)
             {
-                std::cerr << "Metadata file modified on disk for " << meta_fname << ", reloading metadata" << std::endl;
-                reload_metadata();
+                // The header could not be read, so where the entry is is unknown
+                break;
             }
 
             file.seekg(offset);
@@ -424,6 +462,12 @@ public:
 
     bool replace_meta_entry(size_t id, metadata_entry *new_entry)
     {
+        if (!is_valid)
+        {
+            // The header could not be read, so where the entry is is unknown
+            return false;
+        }
+
         const size_t offset = header_size + (entry_file_line_size * id);
 
         for (size_t i = 0; i < IO_RETRY_COUNT; i++)
@@ -1458,8 +1502,9 @@ public:
 
     // With failed set, a chunk that exists but cannot be read (the .meta or
     // .data cannot be opened or is short, the data does not decode, memory
-    // runs out) sets *failed; its voxels read as 0 either way. A chunk never
-    // written or a missing mchunk is not a failure.
+    // runs out, the mchunk header is unusable) sets *failed; its voxels read
+    // as 0 either way. A chunk never written or a missing mchunk is not a
+    // failure.
     uint16_t *load_region(
         size_t scale,
         size_t xs, size_t xe,
@@ -1564,9 +1609,26 @@ public:
                                     continue;
                                 }
 
+                                if (!chunk_reader->is_valid)
+                                {
+                                    // Its last reload failed; retry if the file changed since
+                                    chunk_reader->reload_if_modified();
+                                }
+
                                 last_x = chunk_id_x;
                                 last_y = chunk_id_y;
                                 last_z = chunk_id_z;
+                            }
+
+                            if (!chunk_reader->is_valid)
+                            {
+                                // The mchunk's header could not be read on a reload, so its
+                                // geometry is unknown: its voxels read as 0
+                                if (failed != nullptr)
+                                    *failed = true;
+                                back_mchunks.insert({scale, c, chunk_id_x, chunk_id_y, chunk_id_z});
+                                chunk_reader = nullptr;
+                                continue;
                             }
 
                             // Shift ranges for cropping
@@ -1961,6 +2023,11 @@ public:
                             last_x = chunk_id_x;
                             last_y = chunk_id_y;
                             last_z = chunk_id_z;
+                        }
+
+                        if (!chunk_reader->is_valid)
+                        {
+                            return reject("Unusable mchunk header", chunk_reader->meta_fname);
                         }
 
                         // Shift ranges for cropping
