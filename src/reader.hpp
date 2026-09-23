@@ -25,6 +25,8 @@ Licensed under the terms specified in LICENSE.md
 #include <mutex>
 #include <atomic>
 #include <map>
+#include <unordered_map>
+#include <utility>
 #include <chrono>
 
 #include <nlohmann/json.hpp>
@@ -99,10 +101,120 @@ using json = nlohmann::json;
 
 std::chrono::duration cache_lock_timeout = std::chrono::milliseconds(10);
 
+// A whole decimal number (digits only, no sign, no spaces), as the
+// environment settings take them. False for anything else, or a number
+// that does not fit in a size_t.
+bool parse_decimal(const std::string &s, size_t &out)
+{
+    if (s.empty() || s.size() > 19) // 19 digits always fit in 64 bits
+    {
+        return false;
+    }
+    size_t v = 0;
+    for (char ch : s)
+    {
+        if (ch < '0' || ch > '9')
+        {
+            return false;
+        }
+        v = v * 10 + (ch - '0');
+    }
+    out = v;
+    return true;
+}
+
+// The global chunk cache: a ring of decoded chunks, the oldest replaced
+// first, with a hash index from (mchunk, chunk) to the chunk's line, so a
+// lookup no longer scans every line. Its size is CHUNK_CACHE_LINES (100
+// when unset). Everything below is guarded by global_chunk_cache_mutex.
+const size_t global_cache_default_lines = 100;
+const size_t global_cache_max_lines = 1000000;
+
+size_t chunk_cache_lines_from_env()
+{
+    const char *s = std::getenv("CHUNK_CACHE_LINES");
+    if (s == nullptr || *s == '\0')
+    {
+        return global_cache_default_lines;
+    }
+    size_t n = 0;
+    if (!parse_decimal(s, n) || n == 0 || n > global_cache_max_lines)
+    {
+        std::cerr << "CHUNK_CACHE_LINES ignored (not a whole number from 1 to " << global_cache_max_lines
+                  << "): " << s << "; using " << global_cache_default_lines << std::endl;
+        return global_cache_default_lines;
+    }
+    return n;
+}
+
+struct global_chunk_key_hash
+{
+    size_t operator()(const std::pair<size_t, size_t> &k) const
+    {
+        return std::hash<size_t>()(k.first * 0x9E3779B97F4A7C15ULL ^ k.second);
+    }
+};
+
 std::timed_mutex global_chunk_cache_mutex;
-size_t global_cache_size = 100;
+size_t global_cache_size = chunk_cache_lines_from_env();
 global_chunk_line *global_chunk_cache = (global_chunk_line *)calloc(global_cache_size, sizeof(global_chunk_line));
 size_t global_chunk_cache_last = 0;
+// Only lines that hold a chunk (ptr != 0) are indexed, one line per chunk
+std::unordered_map<std::pair<size_t, size_t>, size_t, global_chunk_key_hash> global_chunk_index = []()
+{
+    std::unordered_map<std::pair<size_t, size_t>, size_t, global_chunk_key_hash> m;
+    m.reserve(global_cache_size);
+    return m;
+}();
+
+// The line holding (mchunk, chunk), or nullptr
+global_chunk_line *global_cache_find(size_t mchunk, size_t chunk)
+{
+    auto it = global_chunk_index.find({mchunk, chunk});
+    return it == global_chunk_index.end() ? nullptr : global_chunk_cache + it->second;
+}
+
+// Frees the chunk a line holds, if any, and removes it from the index
+void global_cache_drop(size_t slot)
+{
+    global_chunk_line &line = global_chunk_cache[slot];
+    if (line.ptr == 0)
+    {
+        return;
+    }
+    free(line.ptr);
+    line.ptr = 0;
+    auto it = global_chunk_index.find({line.mchunk, line.chunk});
+    if (it != global_chunk_index.end() && it->second == slot)
+    {
+        global_chunk_index.erase(it);
+    }
+}
+
+// Takes ownership of ptr. A line the chunk already has (e.g. for an older
+// extent) is dropped first, so a lookup can only find the newest one.
+void global_cache_insert(size_t mchunk, size_t chunk, uint16_t *ptr, size_t sizex, size_t sizey, size_t sizez)
+{
+    global_chunk_line *old = global_cache_find(mchunk, chunk);
+    if (old != nullptr)
+    {
+        global_cache_drop(old - global_chunk_cache);
+    }
+
+    const size_t slot = global_chunk_cache_last;
+    global_cache_drop(slot);
+    global_chunk_line &line = global_chunk_cache[slot];
+    line.mchunk = mchunk;
+    line.chunk = chunk;
+    line.ptr = ptr;
+    line.sizex = sizex;
+    line.sizey = sizey;
+    line.sizez = sizez;
+    global_chunk_cache_last = (slot + 1) % global_cache_size;
+
+    // Last: if this throws, the line still owns ptr and is freed when its slot is reused
+    global_chunk_index[{mchunk, chunk}] = slot;
+}
 
 // The log lines this fork adds are rate limited: at most one line per second
 // per kind, and the next line that gets through says how many were dropped
@@ -291,21 +403,16 @@ public:
 
     void clear_cache_lines()
     {
-        global_chunk_cache_mutex.lock();
+        std::lock_guard<std::timed_mutex> lock(global_chunk_cache_mutex);
         // A decode made under the header being replaced must not come back
         data_gen.fetch_add(1);
         for (size_t i = 0; i < global_cache_size; i++)
         {
             if (global_chunk_cache[i].mchunk == this_mchunk_id)
             {
-                if (global_chunk_cache[i].ptr != 0)
-                {
-                    free(global_chunk_cache[i].ptr);
-                }
-                global_chunk_cache[i].ptr = 0;
+                global_cache_drop(i);
             }
         }
-        global_chunk_cache_mutex.unlock();
     }
 
     void reload_metadata(bool reset_cache = true)
@@ -569,30 +676,17 @@ public:
 
         uint16_t *from_cache = 0;
 
-        if (global_chunk_cache_mutex.try_lock_for(cache_lock_timeout))
         {
-            for (size_t i = 0; i < global_cache_size; i++)
+            std::unique_lock<std::timed_mutex> lock(global_chunk_cache_mutex, cache_lock_timeout);
+            if (lock.owns_lock())
             {
-                if (global_chunk_cache[i].chunk == id)
+                const global_chunk_line *line = global_cache_find(this_mchunk_id, id);
+                if (line != nullptr && line->sizex == sizex && line->sizey == sizey && line->sizez == sizez)
                 {
-                    if (global_chunk_cache[i].mchunk == this_mchunk_id &&
-                        global_chunk_cache[i].sizex == sizex &&
-                        global_chunk_cache[i].sizey == sizey &&
-                        global_chunk_cache[i].sizez == sizez)
-                    {
-                        from_cache = global_chunk_cache[i].ptr;
-                        break;
-                    }
+                    from_cache = line->ptr;
+                    memcpy((void *)out, (void *)from_cache, out_buffer_size);
                 }
             }
-
-            // Copy from cache
-            if (from_cache != 0)
-            {
-                memcpy((void *)out, (void *)from_cache, out_buffer_size);
-            }
-
-            global_chunk_cache_mutex.unlock();
         }
 
         // Either from_cache has the chunk, or was not in cache, or failed to get lock
@@ -757,43 +851,18 @@ public:
             // Copy result
             memcpy((void *)out, (void *)read_decomp_buffer, decomp_size);
 
-            bool cache_locked = global_chunk_cache_mutex.try_lock_for(cache_lock_timeout);
-            if (cache_locked && data_gen.load() != gen)
             {
-                // A write to this mchunk finished while this chunk was read, so this
-                // decode may be the chunk it replaced
-                global_chunk_cache_mutex.unlock();
-                cache_locked = false;
-            }
-
-            if (cache_locked)
-            {
-                global_chunk_line *cache_line = global_chunk_cache + global_chunk_cache_last;
-
-                if (cache_line->ptr != 0)
+                std::unique_lock<std::timed_mutex> lock(global_chunk_cache_mutex, cache_lock_timeout);
+                // If data_gen moved, a write to this mchunk finished while this chunk
+                // was read, so this decode may be the chunk it replaced
+                if (lock.owns_lock() && data_gen.load() == gen)
                 {
-                    free(cache_line->ptr);
+                    uint16_t *line_ptr = (uint16_t *)read_decomp_buffer;
+                    read_decomp_buffer = NULL;
+                    global_cache_insert(this_mchunk_id, id, line_ptr, sizex, sizey, sizez);
                 }
-
-                cache_line->chunk = (size_t)id;
-                cache_line->mchunk = (size_t)this_mchunk_id;
-                cache_line->ptr = (uint16_t *)read_decomp_buffer;
-                cache_line->sizex = sizex;
-                cache_line->sizey = sizey;
-                cache_line->sizez = sizez;
-
-                global_chunk_cache_last++;
-                if (global_chunk_cache_last == global_cache_size)
-                {
-                    global_chunk_cache_last = 0;
-                }
-
-                global_chunk_cache_mutex.unlock();
             }
-            else
-            {
-                free(read_decomp_buffer);
-            }
+            free(read_decomp_buffer);
         }
 
         free(sel);
@@ -872,19 +941,10 @@ public:
             data_gen.fetch_add(1);
 
             // Delete the prexisting values in the cache
-            for (size_t i = 0; i < global_cache_size; i++)
+            global_chunk_line *line = global_cache_find(this_mchunk_id, id);
+            if (line != nullptr)
             {
-                if (global_chunk_cache[i].chunk == id)
-                {
-                    if (global_chunk_cache[i].mchunk == this_mchunk_id)
-                    {
-                        if (global_chunk_cache[i].ptr != 0)
-                        {
-                            free(global_chunk_cache[i].ptr);
-                        }
-                        global_chunk_cache[i].ptr = 0;
-                    }
-                }
+                global_cache_drop(line - global_chunk_cache);
             }
         }
 

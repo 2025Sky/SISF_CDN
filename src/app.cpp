@@ -2570,6 +2570,7 @@ int main(int argc, char *argv[])
 	{ // App start logic
 		std::cout << "Using port: " << port << std::endl;
 		std::cout << "Thread count: " << THREAD_COUNT << std::endl;
+		std::cout << "Chunk cache lines: " << global_cache_size << std::endl;
 
 		app.port(port)
 			//.use_compression(crow::compression::algorithm::DEFLATE)
