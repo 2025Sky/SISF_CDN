@@ -1422,7 +1422,8 @@ public:
     {
         std::tuple<size_t, size_t, size_t, size_t, size_t> id_tuple = std::make_tuple(scale, channel, i, j, k);
 
-        mchunk_buffer_mutex.lock();
+        // Released on every return and if anything below throws (e.g. bad_alloc)
+        std::lock_guard<std::mutex> lock(mchunk_buffer_mutex);
 
         packed_reader *out = mchunk_buffer[id_tuple];
 
@@ -1450,7 +1451,6 @@ public:
 
             mchunk_buffer[id_tuple] = out;
         }
-        mchunk_buffer_mutex.unlock();
 
         return out;
     }
