@@ -136,6 +136,13 @@ In testing, a complete build of the applet can be completed in around 5-10 minut
 
 To run the `SISF_CDN`, very little system resources are required at a minimum. If you are running the software on a system with a small number of CPU cores, the number of worker threads can be reduced using the `THREAD_COUNT` environment variable.
 
+Two more environment variables size the server:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `CHUNK_CACHE_LINES` | `100` | How many decoded chunks the server keeps in memory for reuse. Each holds one chunk (64 KiB for a 32x32x32 `uint16` chunk). A value that is not a whole number from 1 to 1000000 is ignored with a log line. |
+| `MAX_READ_VOXELS` | `0` (no limit) | The most voxels times returned channels one image read may assemble; a larger read answers `400`. A projection counts the box it reads, not the one it returns. A value that is not a whole number is ignored with a log line. |
+
 ## Sample Data
 
 See the documentation for [pySISF](https://github.com/Cai-Lab-at-University-of-Michigan/pySISF) for an example dataset, or use one of the example scripts to create one from your own data.

@@ -44,6 +44,9 @@ Licensed under the terms specified in LICENSE.md
 int port = 100;
 int THREAD_COUNT = 32;
 bool READ_ONLY_MODE = false;
+// MAX_READ_VOXELS: the most voxels times channels one image read may
+// assemble; 0 (the default) is no limit
+size_t MAX_READ_VOXELS = 0;
 
 // skeleton_api's upload, replace and delete change traces.sql without any
 // token check (delete is a GET), so they are off unless SKELETON_API_WRITES=1.
@@ -266,6 +269,13 @@ int main(int argc, char *argv[])
 		std::cerr << "SKELETON_API_WRITES ignored (not 0 or 1): " << skeleton_writes << std::endl;
 	}
 	std::cout << "skeleton_api writes: " << (SKELETON_API_WRITES ? "on" : "off (set SKELETON_API_WRITES=1 to allow upload, replace and delete)") << std::endl;
+
+	std::string max_read_voxels = read_env_variable("MAX_READ_VOXELS");
+	if (max_read_voxels.size() > 0 && !parse_decimal(max_read_voxels, MAX_READ_VOXELS))
+	{
+		MAX_READ_VOXELS = 0;
+		std::cerr << "MAX_READ_VOXELS ignored (not a whole number): " << max_read_voxels << std::endl;
+	}
 
 	std::string thread_count = read_env_variable("THREAD_COUNT");
 	if (thread_count.size() > 0)
@@ -2397,17 +2407,17 @@ int main(int argc, char *argv[])
 			}
 		}
 
-		uint16_t * out_buffer;
+		// The box that is read: the one requested, and for a projection that
+		// box extended along the projection axis
+		size_t x_begin_project = x_begin;
+		size_t y_begin_project = y_begin;
+		size_t z_begin_project = z_begin;
+
+		size_t x_end_project = x_end;
+		size_t y_end_project = y_end;
+		size_t z_end_project = z_end;
 
 		if(project_frames > 1) {
-			out_buffer = (uint16_t *) calloc(out_buffer_size, 1);
-			if (out_buffer == NULL)
-			{
-				res.code = crow::status::INTERNAL_SERVER_ERROR;
-				res.end("500 Internal Server Error -- Out of memory\n");
-				return;
-			}
-
 			switch(project_axis) {
 				case 'x':
 				case 'y':
@@ -2416,14 +2426,6 @@ int main(int argc, char *argv[])
 				default:
 					project_axis = 'z';
 			}
-
-			size_t x_begin_project = x_begin;
-			size_t y_begin_project = y_begin;
-			size_t z_begin_project = z_begin;
-
-			size_t x_end_project = x_end;
-			size_t y_end_project = y_end;
-			size_t z_end_project = z_end;
 
 			std::tuple<size_t, size_t, size_t> dataset_size = reader->get_size(scale);
 
@@ -2445,6 +2447,39 @@ int main(int argc, char *argv[])
 				z_end_project += project_frames;
 				z_end_project = std::min(sizez, z_end_project);
 				break;
+			}
+		}
+
+		if (MAX_READ_VOXELS > 0)
+		{
+			// A reversed box wraps to a huge size and counts as too large
+			const size_t read_x = x_end_project - x_begin_project;
+			const size_t read_y = y_end_project - y_begin_project;
+			const size_t read_z = z_end_project - z_begin_project;
+			size_t read_voxels = 0;
+			if (__builtin_mul_overflow(read_x, read_y, &read_voxels) ||
+				__builtin_mul_overflow(read_voxels, read_z, &read_voxels) ||
+				__builtin_mul_overflow(read_voxels, channels_out, &read_voxels) ||
+				read_voxels > MAX_READ_VOXELS)
+			{
+				res.code = crow::status::BAD_REQUEST;
+				res.end("400 Bad Request -- Read too large: " + std::to_string(read_x) + "x" + std::to_string(read_y) + "x" +
+						std::to_string(read_z) + " voxels x " + std::to_string(channels_out) +
+						" channels is more than the limit of " + std::to_string(MAX_READ_VOXELS) +
+						"; read a smaller box, or one channel with +channel=N\n");
+				return;
+			}
+		}
+
+		uint16_t * out_buffer;
+
+		if(project_frames > 1) {
+			out_buffer = (uint16_t *) calloc(out_buffer_size, 1);
+			if (out_buffer == NULL)
+			{
+				res.code = crow::status::INTERNAL_SERVER_ERROR;
+				res.end("500 Internal Server Error -- Out of memory\n");
+				return;
 			}
 
 			const size_t x_project_size = x_end_project - x_begin_project;
@@ -2592,6 +2627,7 @@ int main(int argc, char *argv[])
 		std::cout << "Using port: " << port << std::endl;
 		std::cout << "Thread count: " << THREAD_COUNT << std::endl;
 		std::cout << "Chunk cache lines: " << global_cache_size << std::endl;
+		std::cout << "Read limit (voxels x channels): " << (MAX_READ_VOXELS > 0 ? std::to_string(MAX_READ_VOXELS) : "none") << std::endl;
 
 		app.port(port)
 			//.use_compression(crow::compression::algorithm::DEFLATE)

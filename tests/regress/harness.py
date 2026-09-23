@@ -684,6 +684,45 @@ def sc_channel_filter(server, results, sid):
     results[f"{sid}: vol1c channel 1"] = digest(*server.request("GET", "/vol1c+channel=1/1/" + box(0, 8, 0, 8, 0, 1)))
 
 
+def sc_read_limit(server, results, sid):
+    """MAX_READ_VOXELS caps the voxels x channels one read assembles. A
+    second server on the same data starts with the limit set to what a
+    70x60x19 read of the 3-channel fixture needs. That read, and one plane
+    less, answer as without a limit; one plane more answers 400, and so does
+    a projection of one plane that reads all 20; the whole box with one
+    channel selected fits and equals that channel of the whole read. A
+    server whose limit is not a number logs that it ignores it and reads as
+    without one. Production ignores the variable."""
+    limit = 70 * 60 * 19 * 3
+    for env, cases in (
+            ({"MAX_READ_VOXELS": str(limit)}, [
+                ("under the limit", "/vol3c/1/" + box(0, 70, 0, 60, 0, 18)),
+                ("at the limit", "/vol3c/1/" + box(0, 70, 0, 60, 0, 19)),
+                ("one plane over", "/vol3c/1/" + box(0, 70, 0, 60, 0, 20)),
+                ("projection at the limit", "/vol3c+project=18/1/" + box(0, 70, 0, 60, 0, 1)),
+                ("projection over", "/vol3c+project=20/1/" + box(0, 70, 0, 60, 0, 1)),
+                ("reversed box", "/vol3c/1/" + box(8, 2, 0, 8, 0, 1))]),
+            ({"MAX_READ_VOXELS": "lots"}, [("limit not a number", "/vol3c/1/" + box(0, 70, 0, 60, 0, 20))])):
+        tag = env["MAX_READ_VOXELS"]
+        limited = Server(f"{server.role}-limit-{tag}", server.image, server.platform, server.data_dir, env)
+        try:
+            limited.start()
+            for name, path in cases:
+                results[f"{sid}: {name}"] = digest(*limited.request("GET", path))
+            if tag == str(limit):
+                st, full = server.request("GET", "/vol3c/1/" + box(0, 70, 0, 60, 0, 20))
+                st1, part = limited.request("GET", "/vol3c+channel=1/1/" + box(0, 70, 0, 60, 0, 20))
+                results[f"{sid}: whole box, one channel"] = (_slice_check(full, part, 1, 3) if st == st1 == 200
+                                                             else digest(st1, part))
+            else:
+                log = "\n".join(limited.logs_tail(200))
+                results[f"{sid}: limit not a number, logged"] = {
+                    "status": "logged" if "MAX_READ_VOXELS ignored" in log else "not logged",
+                    "len": None, "sha256": None, "text": None}
+        finally:
+            limited.remove()
+
+
 def sc_raw_access_outside(server, results, sid):
     """raw_access over a range wider than the mchunk's stored tile (vol1c's
     mchunk (0,0,0) is 64 px wide). Production reads past the chunk buffer."""
@@ -1020,6 +1059,7 @@ SCENARIOS = [
     ("s17 keep-alive connections", sc_keepalive),
     ("s18 skeleton_api writes", sc_skeleton_api_writes),
     ("s13 channel filter", sc_channel_filter),
+    ("s14 read limit", sc_read_limit),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]

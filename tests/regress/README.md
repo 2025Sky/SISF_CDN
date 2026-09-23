@@ -70,7 +70,11 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
   - s13: `+channel=N` reads of the 3-channel fixture, each checked against
     channel N's block of the same read without the filter (boxes, a plane,
     a coarser level, a projection, a gaussian filter), and channels that do
-    not exist.
+    not exist;
+  - s14: a second server on the same data started with `MAX_READ_VOXELS`
+    set: reads under, at and over the limit, a projection over it, a
+    reversed box, one channel of a box that is over it with every channel,
+    and a server whose limit is not a number.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
