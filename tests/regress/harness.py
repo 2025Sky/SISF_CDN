@@ -1124,6 +1124,93 @@ def sc_replaced_during_read(server, results, sid):
         "len": None, "sha256": None, "text": None}
 
 
+def sc_seg_gzip(server, results, sid):
+    """SEG_GZIP=N sends a successful image read of a writable (protected)
+    layer gzip-encoded (level N) to a client whose Accept-Encoding accepts
+    gzip; nothing else is compressed. Second servers on the same data: with
+    SEG_GZIP=1, =9, unset, =0 and a value that is not a level. Every body is
+    compared with production's after decoding; its headers are recorded
+    apart. With 1: reads of writable layers (a box, a 32^3 chunk, a plane,
+    a projection, one channel, an empty segmentation, a body that stays
+    over 1 MiB compressed (crow sends those in pieces), the portal's read
+    with its token and httpx's header, a browser's header, a q value and
+    upper case, a body of exactly 1024 bytes) are compressed; a body of
+    1022 bytes or one voxel, labels that do not compress (noise), gzip
+    refused with q=0 or with a q value that is not one, identity, deflate
+    or "*" only, no Accept-Encoding at all, image layers, a 400, a 404,
+    /info and raw_access are not. Unset, 0 and the value that is not a
+    level compress nothing (that value is logged). Production ignores the
+    variable and Accept-Encoding."""
+    noise = os.path.join(server.data_dir, "sc_gzip_noise")
+    fixtures.write_metadata(noise, 1, (64, 64, 32), RES, (64, 64, 32))
+    name = "chunk_0_0_0.0.1X"
+    fixtures.create_shard(f"{noise}/data/{name}.data", f"{noise}/meta/{name}.meta",
+                          np.random.default_rng(16).integers(0, 65536, size=(64, 64, 32), dtype=np.uint16),
+                          (32, 32, 32))
+    with open(f"{noise}/.sisf_access", "w") as f:
+        f.write(fixtures.TOKEN + "\n")
+    # seg_prefilled as built: the write stage changes seg_prefilled itself
+    fixtures.segmentation(os.path.join(server.data_dir, "sc_gzip_labels"), (100, 90, 37), (64, 64, 32), RES,
+                          prefill_seed=5)
+    fixtures.segmentation(os.path.join(server.data_dir, "sc_gzip_empty"), (128, 128, 64), (64, 64, 32), RES)
+    fixtures.segmentation(os.path.join(server.data_dir, "sc_gzip_big"), (256, 256, 64), (128, 128, 64), RES,
+                          prefill_seed=16)
+    seg_box = "/sc_gzip_labels/1/" + box(0, 100, 0, 90, 0, 37)
+    portal = f"/sc_gzip_labels+token={fixtures.TOKEN}/1/" + box(0, 64, 0, 64, 0, 32)
+    on_cases = [
+        ("writable layer, box", seg_box, "gzip"),
+        ("writable layer, 32^3 chunk", "/sc_gzip_labels/1/" + box(32, 64, 32, 64, 0, 32), "gzip"),
+        ("writable layer, plane", "/sc_gzip_labels/1/" + box(0, 100, 0, 90, 20, 21), "gzip"),
+        ("writable layer, projection", "/sc_gzip_labels+project=5/1/" + box(0, 100, 0, 90, 3, 4), "gzip"),
+        ("writable layer, channel 0", "/sc_gzip_labels+channel=0/1/" + box(0, 64, 0, 64, 0, 32), "gzip"),
+        ("empty segmentation", "/sc_gzip_empty/1/" + box(0, 128, 0, 128, 0, 64), "gzip"),
+        ("over 1 MiB compressed", "/sc_gzip_big/1/" + box(0, 256, 0, 256, 0, 64), "gzip"),
+        ("portal read (token, httpx's header)", portal, "gzip, deflate"),
+        ("browser's header", seg_box, "gzip, deflate, br, zstd"),
+        ("q value and upper case", seg_box, "deflate;q=1, GZIP ; q=0.5"),
+        ("1024 bytes", "/sc_gzip_labels/1/" + box(0, 32, 0, 16, 0, 1), "gzip"),
+        ("1022 bytes", "/sc_gzip_labels/1/" + box(0, 73, 0, 7, 0, 1), "gzip"),
+        ("one voxel", "/sc_gzip_labels/1/" + box(0, 1, 0, 1, 0, 1), "gzip"),
+        ("labels that do not compress", "/sc_gzip_noise/1/" + box(0, 64, 0, 64, 0, 32), "gzip"),
+        ("gzip refused (q=0)", seg_box, "gzip;q=0, deflate"),
+        ("gzip with a q value that is not one", seg_box, "gzip;q=2"),
+        ("identity only", seg_box, "identity"),
+        ("deflate only", seg_box, "deflate"),
+        ("* only", seg_box, "*"),
+        ("no Accept-Encoding", seg_box, None),
+        ("image layer", "/vol1c/1/" + box(0, 64, 0, 64, 0, 32), "gzip"),
+        ("image layer, 3 channels", "/vol3c/1/" + box(0, 70, 0, 60, 0, 20), "gzip"),
+        ("writable layer, box out of range (400)", "/sc_gzip_labels/1/" + box(0, 200, 0, 8, 0, 1), "gzip"),
+        ("unknown dataset (404)", "/nope/1/" + box(0, 8, 0, 8, 0, 1), "gzip"),
+        ("writable layer, /info", "/sc_gzip_labels/info", "gzip"),
+        ("writable layer, raw_access", "/sc_gzip_labels/raw_access/0,0,0,0/1/" + box(0, 64, 0, 64, 0, 32), "gzip"),
+    ]
+    few_cases = [("writable layer, box", seg_box, "gzip"),
+                 ("portal read (token, httpx's header)", portal, "gzip, deflate")]
+    for tag, cases in (("1", on_cases), ("9", few_cases), ("unset", few_cases), ("0", few_cases),
+                       ("fast", few_cases)):
+        env = {} if tag == "unset" else {"SEG_GZIP": tag}
+        other = Server(f"{server.role}-gzip-{tag}", server.image, server.platform, server.data_dir, env)
+        try:
+            other.start()
+            for name_, path, accept in cases:
+                _encoded_read(other, results, f"{sid}: SEG_GZIP={tag}: {name_}", path, accept)
+            log = other.logs_tail(200)
+            results[f"{sid}: SEG_GZIP={tag}: startup line"] = {
+                "status": "line", "len": None, "sha256": None,
+                "text": _startup_line(log, "Gzip for writable layers:")}
+            if tag == "fast":
+                results[f"{sid}: SEG_GZIP={tag}: logged"] = {
+                    "status": "logged" if any("SEG_GZIP ignored" in line for line in log) else "not logged",
+                    "len": None, "sha256": None, "text": None}
+        finally:
+            # Kept beside <work>/<role>.log: these are the only servers that
+            # compress, so a sanitizer build's report for that code is here
+            other.stop()
+            other.save_logs(os.path.join(os.path.dirname(server.data_dir), f"{other.role}.log"))
+            other.remove()
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
 # s7 runs last: production dies in it, and nothing should depend on a server
@@ -1144,11 +1231,13 @@ SCENARIOS = [
     ("s13 channel filter", sc_channel_filter),
     ("s14 read limit", sc_read_limit),
     ("s15 files replaced during a read", sc_replaced_during_read),
+    ("s16 gzip for writable layers", sc_seg_gzip),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
 SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short", "sc_strict", "sc_regrow", "sc_regrow_w",
-                     "sc_cold", "sc_video", "sc_ka_image", "sc_ka_labels", "sc_rename"]
+                     "sc_cold", "sc_video", "sc_ka_image", "sc_ka_labels", "sc_rename", "sc_gzip_labels",
+                     "sc_gzip_noise", "sc_gzip_empty", "sc_gzip_big"]
 
 
 def run_scenarios(server, results):

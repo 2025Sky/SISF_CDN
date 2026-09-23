@@ -84,7 +84,20 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
     that keeps its files open must not put the old files' chunks into the
     cache). Every answer compared is the same wherever the rename lands;
     whether it catches a broken build depends on it landing while the long
-    read is still reading (see `stress_d6.py --mode rename`).
+    read is still reading (see `stress_d6.py --mode rename`);
+  - s16: servers on the same data started with `SEG_GZIP=1`, `=9`, `=0`,
+    unset and a value that is not a level, sent reads with a chosen
+    `Accept-Encoding` (or none). Each answer is recorded twice: the body
+    after decoding, which must equal production's (production never
+    compresses), and its `Content-Encoding`, `Vary` and decoded SHA-256.
+    Writable-layer reads that accept gzip must come back compressed (a box,
+    a 32^3 chunk, a plane, a projection, one channel, an empty
+    segmentation, a body over 1 MiB compressed, the portal's token read
+    with httpx's header, a browser's header, a q value, exactly 1024
+    bytes); a body under 1024 bytes, noise that does not compress, gzip
+    refused or not offered, image layers, errors, `/info` and `raw_access`
+    must not, and nothing is compressed when the variable is unset, 0 or
+    invalid.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
@@ -99,8 +112,9 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
   a listed difference that did not occur (the candidate behaves like the
   baseline there again), and a listed difference where an answer is not the
   expected one.
-- Each server's full log is saved to `<work>/<role>.log`, and s18's other
-  servers' to `<work>/<role>-skeleton-<value>.log`.
+- Each server's full log is saved to `<work>/<role>.log`, each of s16's
+  servers' to `<work>/<role>-gzip-<value>.log`, and s18's other servers' to
+  `<work>/<role>-skeleton-<value>.log`.
 
 `--candidate-env KEY=VALUE` (repeatable) starts the candidate with that
 environment variable, e.g. `CHUNK_CACHE_LINES=4096` to check that a larger
