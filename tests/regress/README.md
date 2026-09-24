@@ -46,7 +46,21 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
     PATCH;
   - s11, s12: a dataset whose `metadata.bin` is empty, or names an mchunk
     size of 0 (production divides by it in the inventory scan; the harness
-    removes the dataset before restarting a server that died on it).
+    removes the dataset before restarting a server that died on it);
+  - s17: reads sent one after another on one keep-alive connection, as
+    the portal's httpx pool and browsers send them: an image read over
+    1 MiB, then a mesh file (a route that adds two headers), and the
+    reverse; then GETs sent with `Expect: 100-continue` mixed with large
+    and small reads, the last with `Connection: close`; then 16 threads,
+    each on its own connection, cycling through large and small reads (448
+    in all), every body checked against the same read on a fresh
+    connection. After a body of 1 MiB or more, production's crow leaves a
+    stale `connection` header in the connection's next response, which
+    then carries two `Connection` headers, and frees it while that
+    response is still being sent. Its `100 Continue` shares the completion
+    of a whole response, which clears the real answer while it is still
+    queued: the first body byte goes out as 0, and a `Connection: close`
+    answer is cut off. The sanitizer build aborts on both.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a

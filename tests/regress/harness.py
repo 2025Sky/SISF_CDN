@@ -23,7 +23,9 @@ the baseline there again.
 """
 
 import argparse
+import gzip
 import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -129,17 +131,76 @@ class Server:
         except urllib.error.HTTPError as e:
             return e.code, e.read()
         except Exception as e:  # connection reset, refused, timeout
-            time.sleep(1)
-            alive, code = self.running()
-            if not alive:
-                tail = self.logs_tail()
-                if before_restart is not None:
-                    before_restart()
-                self.restart()
-                return "CRASH", f"exit={code}; {' | '.join(tail[-4:])}; {type(e).__name__}"
-            if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
-                return "TIMEOUT", f"no response within {timeout} s"
-            return "NOCONN", f"{type(e).__name__}: {e}"
+            return self._failed(e, timeout, before_restart)
+
+    def get_encoded(self, path, accept_encoding, timeout=120):
+        """A GET that sends accept_encoding as its Accept-Encoding header, or
+        no such header when it is None (urllib always sends "identity").
+        Returns (status, headers with lower-case names, body as sent);
+        status is 'CRASH', 'TIMEOUT' or 'NOCONN' as for request()."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        try:
+            conn.putrequest("GET", path, skip_accept_encoding=True)
+            if accept_encoding is not None:
+                conn.putheader("Accept-Encoding", accept_encoding)
+            conn.endheaders()
+            r = conn.getresponse()
+            return r.status, {k.lower(): v for k, v in r.getheaders()}, r.read()
+        except Exception as e:
+            status, text = self._failed(e, timeout, None)
+            return status, {}, text
+        finally:
+            conn.close()
+
+    def get_keepalive(self, reqs, timeout=120):
+        """Sends each (path, accept_encoding[, extra]) of reqs as a GET on ONE
+        HTTP/1.1 connection, each after the answer before it was read in full;
+        an accept_encoding of None sends no such header, and extra is a tuple
+        of (name, value) headers to add (http.client reads and skips a
+        100 Continue before an answer). Returns one
+        (status, headers, body as sent, reused) per request sent, where
+        headers is the list of (lower-case name, value) pairs, so a repeated
+        header shows twice, and reused says whether the request went out on
+        the connection the first one opened (http.client opens a new one
+        silently when the server has closed it). After a failure the list
+        ends with that request's ('CRASH' | 'TIMEOUT' | 'NOCONN', [], text,
+        reused) and the rest are not sent."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        out, first = [], None
+        try:
+            for path, accept_encoding, *extra in reqs:
+                reused = True
+                try:
+                    conn.putrequest("GET", path, skip_accept_encoding=True)
+                    if accept_encoding is not None:
+                        conn.putheader("Accept-Encoding", accept_encoding)
+                    for name, value in (extra[0] if extra else ()):
+                        conn.putheader(name, value)
+                    conn.endheaders()
+                    first = first or conn.sock
+                    reused = conn.sock is first
+                    r = conn.getresponse()
+                    out.append((r.status, [(k.lower(), v) for k, v in r.getheaders()], r.read(), reused))
+                except Exception as e:
+                    status, text = self._failed(e, timeout, None)
+                    out.append((status, [], text, reused))
+                    break
+        finally:
+            conn.close()
+        return out
+
+    def _failed(self, e, timeout, before_restart):
+        time.sleep(1)
+        alive, code = self.running()
+        if not alive:
+            tail = self.logs_tail()
+            if before_restart is not None:
+                before_restart()
+            self.restart()
+            return "CRASH", f"exit={code}; {' | '.join(tail[-4:])}; {type(e).__name__}"
+        if isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError):
+            return "TIMEOUT", f"no response within {timeout} s"
+        return "NOCONN", f"{type(e).__name__}: {e}"
 
 
 def file_sha(path):
@@ -583,6 +644,204 @@ def sc_raw_access_outside(server, results, sid):
     results[f"{sid}: read"] = digest(*server.request("GET", "/vol1c/raw_access/0,0,0,0/1/" + box(0, 100, 0, 10, 0, 1)))
 
 
+def _encoded_read(server, results, key, path, accept_encoding):
+    """Two results for a GET sent with accept_encoding: key, the body after
+    decoding it (it must equal production's, which never compresses), and
+    key + ", headers", its Content-Encoding and Vary and that body's SHA-256
+    (plus any Content-Length that is not the length sent, and a gzip body
+    that is not shorter than what it decodes to)."""
+    _record_encoded(results, key, *server.get_encoded(path, accept_encoding))
+
+
+def _record_encoded(results, key, st, headers, raw, note=""):
+    """Records one answer as _encoded_read describes; headers maps lower-case
+    names to values, and note is added at the end of the headers record."""
+    body, ce = raw, headers.get("content-encoding")
+    if isinstance(raw, bytes) and ce is not None:
+        try:
+            body = gzip.decompress(raw) if ce == "gzip" else f"unknown Content-Encoding {ce}"
+        except Exception as e:
+            body = f"not gzip: {type(e).__name__}: {e}"
+    results[key] = digest(st, body)
+    text = f"Content-Encoding: {ce or '-'}; Vary: {headers.get('vary') or '-'}"
+    if isinstance(body, bytes):
+        text += f"; decoded sha256 {hashlib.sha256(body).hexdigest()}"
+    if isinstance(raw, bytes):
+        cl = headers.get("content-length")
+        if cl is not None and cl != str(len(raw)):
+            text += f"; Content-Length {cl} but {len(raw)} bytes sent"
+        if ce == "gzip" and isinstance(body, bytes) and len(raw) >= len(body):
+            text += "; not shorter than the body"
+    results[key + ", headers"] = {"status": st, "len": None, "sha256": None, "text": text + note}
+
+
+def _startup_line(log, prefix):
+    for line in log:
+        if line.startswith(prefix):
+            return line
+    return "none"
+
+
+KA_THREADS, KA_PER_THREAD = 16, 28
+
+
+def _first_values(pairs):
+    out = {}
+    for k, v in pairs:
+        out.setdefault(k, v)
+    return out
+
+
+def _keepalive_case(server, results, key, reqs):
+    """Sends reqs, (tag, path, accept_encoding[, extra headers]) each, on one
+    connection and records each answer as _encoded_read does under
+    key + ": " + tag, its headers record adding the number of Connection
+    headers and whether the request went out on a new connection."""
+    answers = server.get_keepalive([r[1:] for r in reqs])
+    for (tag, *_), (st, pairs, raw, reused) in zip(reqs, answers):
+        n = sum(1 for k, _ in pairs if k == "connection")
+        note = f"; Connection headers: {n}" + ("" if reused else "; on a new connection")
+        _record_encoded(results, f"{key}: {tag}", st, _first_values(pairs), raw, note)
+    for tag, *_ in reqs[len(answers):]:
+        results[f"{key}: {tag}"] = {"status": "not sent", "len": None, "sha256": None,
+                                    "text": "an earlier request on the connection failed"}
+
+
+def _keepalive_stress(server, results, key, plan):
+    """KA_THREADS threads, each on its own connection, send KA_PER_THREAD
+    GETs, thread t taking plan[(t + i) % len(plan)] as its i-th, so every
+    pair of neighbours in plan follows each other on some connection. Every
+    answer must have the status and decoded body of the same request on a
+    fresh connection, a Content-Length equal to what was sent, and go out on
+    the thread's first connection. Records key (the count of problems, or
+    CRASH) and key + ", second Connection headers" (answers with more than
+    one Connection header)."""
+    refs = {}
+    for path, accept in plan:
+        st, headers, raw = server.get_encoded(path, accept)
+        if isinstance(raw, bytes) and headers.get("content-encoding") == "gzip":
+            raw = gzip.decompress(raw)
+        refs[(path, accept)] = (st, hashlib.sha256(raw).hexdigest() if isinstance(raw, bytes) else raw)
+    problems, counts, lock = [], {"sent": 0, "dups": 0}, threading.Lock()
+
+    def worker(t):
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=120)
+        first = None
+        try:
+            for i in range(KA_PER_THREAD):
+                path, accept = plan[(t + i) % len(plan)]
+                where = f"thread {t} request {i} ({path}, {accept})"
+                try:
+                    conn.putrequest("GET", path, skip_accept_encoding=True)
+                    if accept is not None:
+                        conn.putheader("Accept-Encoding", accept)
+                    conn.endheaders()
+                    first = first or conn.sock
+                    reused = conn.sock is first
+                    r = conn.getresponse()
+                    pairs = [(k.lower(), v) for k, v in r.getheaders()]
+                    raw = r.read()
+                except Exception as e:
+                    with lock:
+                        problems.append(f"{where}: {type(e).__name__}: {e}")
+                    return
+                headers = _first_values(pairs)
+                bad = []
+                if not reused:
+                    bad.append("on a new connection")
+                if headers.get("content-length") != str(len(raw)):
+                    bad.append(f"Content-Length {headers.get('content-length')} but {len(raw)} bytes")
+                try:
+                    body = gzip.decompress(raw) if headers.get("content-encoding") == "gzip" else raw
+                except Exception as e:
+                    body = f"not gzip: {type(e).__name__}"
+                if (r.status, hashlib.sha256(body).hexdigest() if isinstance(body, bytes) else body) != refs[(path, accept)]:
+                    bad.append("answer differs from the read on a fresh connection")
+                with lock:
+                    counts["sent"] += 1
+                    counts["dups"] += int(sum(1 for k, _ in pairs if k == "connection") > 1)
+                    problems.extend(f"{where}: {b}" for b in bad)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(KA_THREADS)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    text = f"{counts['sent']} answers on {KA_THREADS} connections, {len(problems)} problems"
+    if problems:
+        text += f"; first: {sorted(problems)[0]}"
+    alive, code = server.running()
+    if not alive:
+        tail = server.logs_tail()
+        server.restart()
+        results[key] = {"status": "CRASH", "len": None, "sha256": None,
+                        "text": f"exit={code}; {' | '.join(tail[-4:])}; {text}"}
+    else:
+        results[key] = {"status": "ok" if not problems else "problems", "len": None, "sha256": None, "text": text}
+    results[key + ", second Connection headers"] = {"status": "count", "len": None, "sha256": None,
+                                                    "text": str(counts["dups"])}
+
+
+def sc_keepalive(server, results, sid):
+    """Reads sent one after another on one HTTP/1.1 connection, each after
+    the answer before it was read in full, as the portal's httpx pool and
+    browsers send them. crow sends a body of 1 MiB or more synchronously
+    inside res.end() and clears the response; production's crow then set a
+    `connection: Keep-Alive` header on that cleared response, so the header
+    stayed for the connection's next request: it went out again as a second
+    Connection header, and that request freed it (set_header replaces it)
+    while the rest of that answer's headers were still queued. asio sends 16
+    buffers at a time and crow uses 4 per header, so an answer with enough
+    headers of its own (the mesh route's Content-Type and
+    Content-Disposition) then sends freed memory. The sanitizer build aborts
+    there; a release build hands the freed block straight back for the same
+    header, so only the second Connection header shows.
+    Each case on its own connection: an image read over 1 MiB, then a mesh
+    file, and the reverse; then GETs carrying Expect: 100-continue mixed with
+    large and small reads, the last one with Connection: close. crow answers
+    100 Continue and, since a GET has no body, queues the real answer behind
+    it at once; production's crow finished the 100's write with the
+    completion of a whole response, clearing res, the body copy (the first
+    body byte went out as 0) and, for a close, the connection while the real
+    answer's buffers were still queued. Each answer is recorded as
+    _encoded_read does, its headers record adding the number of Connection
+    headers. Then a short stress (see _keepalive_stress): bodies over 1 MiB
+    and small ones, each followed on the same connection by another."""
+    img, lab = "sc_ka_image", "sc_ka_labels"
+    fixtures.untiled(os.path.join(server.data_dir, img), fixtures.pattern((1, 128, 128, 64), 17), (64, 64, 32),
+                     RES, 1)
+    lab_root = os.path.join(server.data_dir, lab)
+    fixtures.segmentation(lab_root, (128, 128, 64), (64, 64, 32), RES, prefill_seed=17)
+    os.makedirs(os.path.join(lab_root, "mesh"))
+    with open(os.path.join(lab_root, "mesh", "1:0:0"), "wb") as f:
+        f.write(np.arange(1000, dtype=np.float32).tobytes())
+    big_img = f"/{img}/1/" + box(0, 128, 0, 128, 0, 64)  # 2 MiB
+    big_lab = f"/{lab}/1/" + box(0, 128, 0, 128, 0, 64)  # 2 MiB
+    chunk = f"/{lab}/1/" + box(32, 64, 32, 64, 0, 32)  # first voxel is not 0
+    mesh = f"/{lab}/mesh/mesh/1:0:0"
+    portal = f"/{lab}+token={fixtures.TOKEN}/1/" + box(0, 64, 0, 64, 0, 32)
+    httpx = "gzip, deflate"
+    _keepalive_case(server, results, f"{sid}: image over 1 MiB, then a mesh file",
+                    [("1 image", big_img, httpx), ("2 mesh file", mesh, httpx)])
+    _keepalive_case(server, results, f"{sid}: a mesh file, then an image over 1 MiB",
+                    [("1 mesh file", mesh, httpx), ("2 image", big_img, httpx)])
+    expect = (("Expect", "100-continue"),)
+    _keepalive_case(server, results, f"{sid}: Expect: 100-continue among large and small reads",
+                    [("1 image", big_img, httpx),
+                     ("2 mesh file, Expect", mesh, httpx, expect),
+                     ("3 labels over 1 MiB, Expect", big_lab, httpx, expect),
+                     ("4 image, Expect", big_img, httpx, expect),
+                     ("5 portal read", portal, httpx),
+                     ("6 32^3 chunk, Expect", chunk, "gzip", expect),
+                     ("7 portal read, Expect, Connection: close", portal, httpx,
+                      expect + (("Connection", "close"),))])
+    plan = [(big_img, httpx), (portal, httpx), (big_lab, None), (mesh, httpx), (chunk, "gzip"), (big_lab, httpx),
+            (f"/{img}/1/" + box(0, 128, 0, 128, 10, 11), None)]
+    _keepalive_stress(server, results, f"{sid}: stress", plan)
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
 # s7 runs last: production dies in it, and nothing should depend on a server
@@ -598,11 +857,12 @@ SCENARIOS = [
     ("s10 short video frame", sc_short_video_frame),
     ("s11 empty metadata.bin", sc_empty_metadata),
     ("s12 zero mchunk size", sc_zero_mchunk_size),
+    ("s17 keep-alive connections", sc_keepalive),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
 SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short", "sc_strict", "sc_regrow", "sc_regrow_w",
-                     "sc_cold", "sc_video"]
+                     "sc_cold", "sc_video", "sc_ka_image", "sc_ka_labels"]
 
 
 def run_scenarios(server, results):
