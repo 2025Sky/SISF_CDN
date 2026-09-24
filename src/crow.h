@@ -9325,9 +9325,16 @@ namespace crow
                         self->complete_request();
                     };
                     need_to_call_after_handlers_ = true;
+                    // Nothing may change res.headers after this call: res.end()
+                    // has already built the response's buffers from them
+                    // (prepare_buffers also writes "Connection: Keep-Alive"
+                    // when add_keep_alive_ is set) and their write may still be
+                    // queued. Upstream set a connection header here. After a
+                    // body of 1 MiB or more (sent, and res cleared, inside
+                    // res.end()) that header stayed into the next request, and
+                    // setting it again there freed it while the next
+                    // response's write still pointed at it.
                     handler_->handle(req_, res, routing_handle_result_);
-                    if (add_keep_alive_)
-                        res.set_header("connection", "Keep-Alive");
                 }
                 else
                 {
