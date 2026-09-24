@@ -2,8 +2,9 @@ name: cai-build-and-regress
 
 # Builds the CDN image natively on amd64 (the architecture production runs) and
 # compares it against the production image with the black-box harness in
-# tests/regress. Nothing is published unless a run is started by hand with
-# publish=true.
+# tests/regress, once as the release build and once as the ASan/UBSan build.
+# Nothing is published unless a run is started by hand with publish=true, and
+# only the release build is.
 
 on:
   push:
@@ -22,7 +23,12 @@ env:
 
 jobs:
   build-and-regress:
+    name: build-and-regress (sanitize ${{ matrix.sanitize }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitize: [ "OFF", "ON" ]
     permissions:
       contents: read
       packages: write
@@ -48,7 +54,9 @@ jobs:
         with:
           context: .
           platforms: linux/amd64
-          build-args: BUILD_THREAD=4
+          build-args: |
+            BUILD_THREAD=4
+            SANITIZE=${{ matrix.sanitize }}
           load: true
           tags: sisf_cdn:candidate
 
@@ -66,15 +74,33 @@ jobs:
           python harness.py --baseline "$BASELINE" --candidate sisf_cdn:candidate \
             --work "$RUNNER_TEMP/regress" --allow expected_diffs.json --report "$RUNNER_TEMP/report.json"
 
+      # ASan aborts on its first error, which the harness already fails as a
+      # candidate crash; this step names the report. UBSan messages do not stop
+      # the server and are listed only (known: crow.h bool loads, the point-cloud
+      # store).
+      - name: Sanitizer reports in the candidate's logs
+        if: always() && matrix.sanitize == 'ON'
+        working-directory: ${{ runner.temp }}/regress
+        run: |
+          ls candidate*.log
+          if grep -n "ERROR: AddressSanitizer" candidate*.log; then
+            echo "AddressSanitizer reported an error (above)"
+            exit 1
+          else
+            echo "no AddressSanitizer reports in $(ls candidate*.log | wc -l) candidate logs"
+          fi
+          echo "UBSan runtime errors by site:"
+          grep -h "runtime error:" candidate*.log | sed -E 's/^[^ ]*\/src\///; s/value [0-9]+/value N/' | sort | uniq -c | sort -rn | head -20 || true
+
       - name: Keep the report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: regress-report
+          name: regress-report-sanitize-${{ matrix.sanitize }}
           path: ${{ runner.temp }}/report.json
 
       - name: Publish to ghcr.io
-        if: github.event_name == 'workflow_dispatch' && inputs.publish
+        if: github.event_name == 'workflow_dispatch' && inputs.publish && matrix.sanitize == 'OFF'
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           img="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::12}"
