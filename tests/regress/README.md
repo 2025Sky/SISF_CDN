@@ -60,7 +60,11 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
     response is still being sent. Its `100 Continue` shares the completion
     of a whole response, which clears the real answer while it is still
     queued: the first body byte goes out as 0, and a `Connection: close`
-    answer is cut off. The sanitizer build aborts on both;
+    answer is cut off. The sanitizer build aborts on both. The same cases
+    and stress run again on a second server with `SEG_GZIP=1`, where a
+    viewer's read of a writable layer is compressed (two more headers, and
+    a 2 MiB labels read goes out below 1 MiB through the asynchronous
+    write) and the portal's token read is not;
   - s18: `skeleton_api` upload, replace and delete (a GET) on a dataset
     with a `traces.sql`, with `ls` and `get` before and after, on this
     server (writes off by default), on a second server with
@@ -113,7 +117,8 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
   baseline there again), and a listed difference where an answer is not the
   expected one.
 - Each server's full log is saved to `<work>/<role>.log`, each of s16's
-  servers' to `<work>/<role>-gzip-<value>.log`, and s18's other servers' to
+  servers' to `<work>/<role>-gzip-<value>.log`, s17's second server's to
+  `<work>/<role>-keepalive.log`, and s18's other servers' to
   `<work>/<role>-skeleton-<value>.log`.
 
 `--candidate-env KEY=VALUE` (repeatable) starts the candidate with that

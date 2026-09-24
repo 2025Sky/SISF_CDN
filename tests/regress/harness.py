@@ -908,7 +908,14 @@ def sc_keepalive(server, results, sid):
     answer's buffers were still queued. Each answer is recorded as
     _encoded_read does, its headers record adding the number of Connection
     headers. Then a short stress (see _keepalive_stress): bodies over 1 MiB
-    and small ones, each followed on the same connection by another."""
+    and small ones, each followed on the same connection by another.
+    The same cases and stress run again on a second server with SEG_GZIP=1,
+    where a writable layer's read that accepts gzip is compressed: it
+    carries two more headers (Content-Encoding and Vary), and a 2 MiB labels
+    read compresses below 1 MiB, so it goes out through the asynchronous
+    write. Those are the conditions of both crow defects on the image route.
+    The portal's token read is sent uncompressed there too. Production
+    ignores SEG_GZIP."""
     img, lab = "sc_ka_image", "sc_ka_labels"
     fixtures.untiled(os.path.join(server.data_dir, img), fixtures.pattern((1, 128, 128, 64), 17), (64, 64, 32),
                      RES, 1)
@@ -931,15 +938,44 @@ def sc_keepalive(server, results, sid):
     _keepalive_case(server, results, f"{sid}: Expect: 100-continue among large and small reads",
                     [("1 image", big_img, httpx),
                      ("2 mesh file, Expect", mesh, httpx, expect),
-                     ("3 labels over 1 MiB, Expect", big_lab, httpx, expect),
+                     # No Accept-Encoding on these two labels reads, so they
+                     # stay uncompressed even in a run with SEG_GZIP set for
+                     # the whole server; the SEG_GZIP=1 server below sends them
+                     # compressed
+                     ("3 labels over 1 MiB, Expect", big_lab, None, expect),
                      ("4 image, Expect", big_img, httpx, expect),
                      ("5 portal read", portal, httpx),
-                     ("6 32^3 chunk, Expect", chunk, "gzip", expect),
+                     ("6 32^3 chunk, Expect", chunk, None, expect),
                      ("7 portal read, Expect, Connection: close", portal, httpx,
                       expect + (("Connection", "close"),))])
     plan = [(big_img, httpx), (portal, httpx), (big_lab, None), (mesh, httpx), (chunk, "gzip"), (big_lab, httpx),
             (f"/{img}/1/" + box(0, 128, 0, 128, 10, 11), None)]
     _keepalive_stress(server, results, f"{sid}: stress", plan)
+    viewer = f"/{lab}/1/" + box(0, 64, 0, 64, 0, 32)  # a viewer's read, compressed under SEG_GZIP
+    other = Server(f"{server.role}-keepalive", server.image, server.platform, server.data_dir, {"SEG_GZIP": "1"})
+    try:
+        other.start()
+        _keepalive_case(other, results, f"{sid}: SEG_GZIP=1: image over 1 MiB, then a compressed read",
+                        [("1 image", big_img, httpx), ("2 labels read", viewer, httpx)])
+        _keepalive_case(other, results, f"{sid}: SEG_GZIP=1: a compressed read, then an image over 1 MiB",
+                        [("1 labels read", viewer, httpx), ("2 image", big_img, httpx)])
+        _keepalive_case(other, results, f"{sid}: SEG_GZIP=1: Expect: 100-continue among large and small reads",
+                        [("1 image", big_img, httpx),
+                         ("2 labels read, Expect", viewer, httpx, expect),
+                         ("3 labels over 1 MiB, Expect", big_lab, httpx, expect),
+                         ("4 image, Expect", big_img, httpx, expect),
+                         ("5 portal read", portal, httpx),
+                         ("6 32^3 chunk, Expect", chunk, "gzip", expect),
+                         ("7 labels read, Expect, Connection: close", viewer, httpx,
+                          expect + (("Connection", "close"),))])
+        plan = [(big_img, httpx), (viewer, httpx), (big_lab, None), (mesh, httpx), (chunk, "gzip"), (big_lab, httpx),
+                (portal, httpx), (f"/{img}/1/" + box(0, 128, 0, 128, 10, 11), None)]
+        _keepalive_stress(other, results, f"{sid}: SEG_GZIP=1: stress", plan)
+    finally:
+        # Kept beside <work>/<role>.log for the sanitizer build's report
+        other.stop()
+        other.save_logs(os.path.join(os.path.dirname(server.data_dir), f"{other.role}.log"))
+        other.remove()
 
 
 SWC_TABLES = """CREATE TABLE SWC(I INT NOT NULL, NEURONID INT NOT NULL, PARENTID INT NOT NULL, X REAL NOT NULL,
