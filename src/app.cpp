@@ -45,6 +45,23 @@ int port = 100;
 int THREAD_COUNT = 32;
 bool READ_ONLY_MODE = false;
 
+// skeleton_api's upload, replace and delete change traces.sql without any
+// token check (delete is a GET), so they are off unless SKELETON_API_WRITES=1.
+// ls and get are not affected.
+bool SKELETON_API_WRITES = false;
+log_limiter log_limit_skeleton_write;
+
+crow::response skeleton_write_refused(const std::string &route, const std::string &data_id)
+{
+	std::string note;
+	if (log_limit_skeleton_write.allow(note))
+	{
+		std::cerr << "Refused skeleton_api/" << route << " for " << data_id
+				  << ": writes are off (SKELETON_API_WRITES)" << note << std::endl;
+	}
+	return crow::response(403, "skeleton_api writes are disabled on this server (set SKELETON_API_WRITES=1 to allow them)\n");
+}
+
 std::string DATA_PATH = "./data/";
 std::string SERVER_ROOT = "https://server/";
 
@@ -238,6 +255,17 @@ int main(int argc, char *argv[])
 		READ_ONLY_MODE = true;
 		std::cout << "Using read only mode." << std::endl;
 	}
+
+	std::string skeleton_writes = read_env_variable("SKELETON_API_WRITES");
+	if (skeleton_writes == "1")
+	{
+		SKELETON_API_WRITES = true;
+	}
+	else if (skeleton_writes.size() > 0 && skeleton_writes != "0")
+	{
+		std::cerr << "SKELETON_API_WRITES ignored (not 0 or 1): " << skeleton_writes << std::endl;
+	}
+	std::cout << "skeleton_api writes: " << (SKELETON_API_WRITES ? "on" : "off (set SKELETON_API_WRITES=1 to allow upload, replace and delete)") << std::endl;
 
 	std::string thread_count = read_env_variable("THREAD_COUNT");
 	if (thread_count.size() > 0)
@@ -1311,6 +1339,9 @@ int main(int argc, char *argv[])
 		if(READ_ONLY_MODE) {
 			return crow::response(crow::status::BAD_REQUEST);
 		}
+		if(!SKELETON_API_WRITES) {
+			return skeleton_write_refused("delete", str_first(data_id_in, '+'));
+		}
 
 		//std::string, std::vector<std::pair<std::string, std::string>>
 		auto [data_id, filters] = parse_filter_list(data_id_in);
@@ -1343,6 +1374,9 @@ int main(int argc, char *argv[])
 																				   {
 		if(READ_ONLY_MODE) {
 			return crow::response(crow::status::BAD_REQUEST);
+		}
+		if(!SKELETON_API_WRITES) {
+			return skeleton_write_refused("replace", str_first(data_id_in, '+'));
 		}
 
 		//std::string, std::vector<std::pair<std::string, std::string>>
@@ -1483,6 +1517,9 @@ int main(int argc, char *argv[])
 																			{
 		if(READ_ONLY_MODE) {
 			return crow::response(crow::status::BAD_REQUEST);
+		}
+		if(!SKELETON_API_WRITES) {
+			return skeleton_write_refused("upload", str_first(data_id_in, '+'));
 		}
 
 		//std::string, std::vector<std::pair<std::string, std::string>>
