@@ -9250,11 +9250,15 @@ namespace crow
             // HTTP 1.1 Expect: 100-continue
             if (req_.http_ver_major == 1 && req_.http_ver_minor == 1 && get_header_value(req_.headers, "expect") == "100-continue")
             {
-                continue_requested = true;
-                buffers_.clear();
+                // The interim answer gets its own write, whose completion
+                // touches nothing: for a request without a body the real
+                // response is built and queued in this same read, so a shared
+                // completion (do_write's) cleared res, the body copy and the
+                // connection while that response's buffers were still queued.
                 static std::string expect_100_continue = "HTTP/1.1 100 Continue\r\n\r\n";
-                buffers_.emplace_back(expect_100_continue.data(), expect_100_continue.size());
-                do_write();
+                auto self = this->shared_from_this();
+                asio::async_write(adaptor_.socket(), asio::buffer(expect_100_continue),
+                                  [self](const error_code&, std::size_t) {});
             }
         }
 
@@ -9663,16 +9667,9 @@ namespace crow
               adaptor_.socket(), buffers_,
               [self](const error_code& ec, std::size_t /*bytes_transferred*/) {
                   self->res.clear();
-                  self->res_body_copy_.clear();                  
-                  if (!self->continue_requested)
-                  {
-                      self->parser_.clear();
-                  }
-                  else
-                  {
-                      self->continue_requested = false;
-                  }
-                  
+                  self->res_body_copy_.clear();
+                  self->parser_.clear();
+
                   if (!ec)
                   {
                       if (self->close_connection_)
@@ -9750,7 +9747,6 @@ namespace crow
 
         detail::task_timer::identifier_type task_id_{};
 
-        bool continue_requested{};
         bool need_to_call_after_handlers_{};
         bool need_to_start_read_after_complete_{};
         bool add_keep_alive_{};
