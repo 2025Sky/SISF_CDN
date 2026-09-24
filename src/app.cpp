@@ -80,8 +80,11 @@ std::string read_too_large(size_t x, size_t y, size_t z)
 // route sends a successful read of a writable (protected) layer gzip-encoded
 // to a client whose Accept-Encoding accepts gzip. Writable layers hold
 // segmentation labels, which compress well; images compress poorly and are
-// never compressed, nor is any other route or any error. Unset or 0 (the
-// default) compresses nothing; any other value is ignored with a log line.
+// never compressed, nor is any other route or any error. A read that carries
+// a token (the portal backend's own reads, from the same host) is not
+// compressed either: it gains no bandwidth there and would pay the
+// compression time on every read before a PATCH. Unset or 0 (the default)
+// compresses nothing; any other value is ignored with a log line.
 int SEG_GZIP_LEVEL = 0;
 
 // A body shorter than this is sent as it is: it fits in one packet either
@@ -2843,8 +2846,9 @@ int main(int argc, char *argv[])
 		res.body = std::string((char *) out_buffer, out_buffer_size);
 		free(out_buffer);
 
-		// Only a writable layer's read, which holds labels (see SEG_GZIP)
-		if (reader->is_protected)
+		// Only a writable layer's read, which holds labels, and not one that
+		// carries a token (strict_read; see SEG_GZIP)
+		if (reader->is_protected && !strict_read)
 		{
 			gzip_body(req, res);
 		}

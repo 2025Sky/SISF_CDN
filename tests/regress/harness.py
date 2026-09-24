@@ -1132,13 +1132,13 @@ def sc_seg_gzip(server, results, sid):
     compared with production's after decoding; its headers are recorded
     apart. With 1: reads of writable layers (a box, a 32^3 chunk, a plane,
     a projection, one channel, an empty segmentation, a body that stays
-    over 1 MiB compressed (crow sends those in pieces), the portal's read
-    with its token and httpx's header, a browser's header, a q value and
-    upper case, a body of exactly 1024 bytes) are compressed; a body of
-    1022 bytes or one voxel, labels that do not compress (noise), gzip
-    refused with q=0 or with a q value that is not one, identity, deflate
-    or "*" only, no Accept-Encoding at all, image layers, a 400, a 404,
-    /info and raw_access are not. Unset, 0 and the value that is not a
+    over 1 MiB compressed (crow sends those in pieces), httpx's header, a
+    browser's header, a q value and upper case, a body of exactly 1024
+    bytes) are compressed; the portal's read with its token (the backend
+    on the same host), a body of 1022 bytes or one voxel, labels that do
+    not compress (noise), gzip refused with q=0 or with a q value that is
+    not one, identity, deflate or "*" only, no Accept-Encoding at all,
+    image layers, a 400, a 404, /info and raw_access are not. Unset, 0 and the value that is not a
     level compress nothing (that value is logged). Production ignores the
     variable and Accept-Encoding."""
     noise = os.path.join(server.data_dir, "sc_gzip_noise")
@@ -1165,6 +1165,7 @@ def sc_seg_gzip(server, results, sid):
         ("writable layer, channel 0", "/sc_gzip_labels+channel=0/1/" + box(0, 64, 0, 64, 0, 32), "gzip"),
         ("empty segmentation", "/sc_gzip_empty/1/" + box(0, 128, 0, 128, 0, 64), "gzip"),
         ("over 1 MiB compressed", "/sc_gzip_big/1/" + box(0, 256, 0, 256, 0, 64), "gzip"),
+        ("httpx's header", "/sc_gzip_labels/1/" + box(0, 64, 0, 64, 0, 32), "gzip, deflate"),
         ("portal read (token, httpx's header)", portal, "gzip, deflate"),
         ("browser's header", seg_box, "gzip, deflate, br, zstd"),
         ("q value and upper case", seg_box, "deflate;q=1, GZIP ; q=0.5"),
@@ -1186,7 +1187,7 @@ def sc_seg_gzip(server, results, sid):
         ("writable layer, raw_access", "/sc_gzip_labels/raw_access/0,0,0,0/1/" + box(0, 64, 0, 64, 0, 32), "gzip"),
     ]
     few_cases = [("writable layer, box", seg_box, "gzip"),
-                 ("portal read (token, httpx's header)", portal, "gzip, deflate")]
+                 ("httpx's header", "/sc_gzip_labels/1/" + box(0, 64, 0, 64, 0, 32), "gzip, deflate")]
     for tag, cases in (("1", on_cases), ("9", few_cases), ("unset", few_cases), ("0", few_cases),
                        ("fast", few_cases)):
         env = {} if tag == "unset" else {"SEG_GZIP": tag}
