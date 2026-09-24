@@ -29,6 +29,7 @@ import http.client
 import json
 import os
 import shutil
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -49,8 +50,9 @@ SCENARIO_TIMEOUT = 20  # s; a write stuck on a leaked lock never answers
 
 
 class Server:
-    def __init__(self, role, image, platform, data_dir):
+    def __init__(self, role, image, platform, data_dir, env=None):
         self.role, self.image, self.platform, self.data_dir = role, image, platform, data_dir
+        self.env = dict(env or {})
         self.name = f"cdn-regress-{role}-{os.getpid()}"
         self.port = None
         # SHA-256 of each file of a scenario dataset as built, before any
@@ -71,6 +73,8 @@ class Server:
     def start(self):
         cmd = ["docker", "run", "-d", "--name", self.name, "-p", "127.0.0.1::6000",
                "-v", f"{self.data_dir}:/data"]
+        for k, v in self.env.items():
+            cmd += ["-e", f"{k}={v}"]
         if self.platform:
             cmd += ["--platform", self.platform]
         subprocess.run(cmd + [self.image], check=True, capture_output=True)
@@ -842,6 +846,120 @@ def sc_keepalive(server, results, sid):
     _keepalive_stress(server, results, f"{sid}: stress", plan)
 
 
+SWC_TABLES = """CREATE TABLE SWC(I INT NOT NULL, NEURONID INT NOT NULL, PARENTID INT NOT NULL, X REAL NOT NULL,
+    Y REAL NOT NULL, Z REAL NOT NULL, R REAL NOT NULL, T INT NOT NULL, USERID INT NOT NULL,
+    TIMESTAMP DATETIME DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE NEURONS(SOMAX REAL, SOMAY REAL, SOMAZ REAL, CELLTYPE INT, NOTES TEXT,
+    TIMESTAMP DATETIME DEFAULT CURRENT_TIMESTAMP);"""
+
+
+def _traces_dataset(root):
+    """A small image dataset holding a traces.sql (the tables the CDN
+    creates) with neurons 1 and 2 of two points each."""
+    fixtures.untiled(root, fixtures.pattern((1, 64, 64, 32), 18), (64, 64, 32), RES, 1)
+    con = sqlite3.connect(os.path.join(root, "traces.sql"))
+    con.executescript(SWC_TABLES)
+    for n in (1, 2):
+        con.execute("INSERT INTO NEURONS (TIMESTAMP) VALUES ('2025-09-29 00:00:00')")
+        con.execute("INSERT INTO SWC VALUES (1, ?, -1, ?, 20.5, 30.25, 1.5, 1, -1, '2025-09-29 00:00:00')", (n, 10.0 * n))
+        con.execute("INSERT INTO SWC VALUES (2, ?, 1, ?, 21.5, 31.25, 1.5, 3, -1, '2025-09-29 00:00:00')", (n, 10.0 * n + 1))
+    con.commit()
+    con.close()
+
+
+def _wait_visible(server, rel):
+    """Waits until the server's container reads data_dir/rel with the bytes
+    written on this side. A traces.sql read right after it was written here
+    once answered "no such table" in the container (1 run in 3, after s17's
+    stress), so the scenario does not send a request before this holds."""
+    want = file_sha(os.path.join(server.data_dir, rel))
+    for _ in range(60):
+        out = subprocess.run(["docker", "exec", server.name, "sha256sum", f"/data/{rel}"],
+                             capture_output=True, text=True).stdout.split()
+        if out and out[0] == want:
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"{server.role} does not see {rel} as written")
+
+
+def _post_multipart(server, path, swc, timeout=120):
+    """POSTs swc as the multipart part named "data", as nTracer uploads a
+    neuron. Returns (status, body) as request() does."""
+    b = "regressboundary7"
+    body = (f"--{b}\r\nContent-Disposition: form-data; name=\"data\"; filename=\"n.swc\"\r\n"
+            f"Content-Type: text/plain\r\n\r\n{swc}\r\n--{b}--\r\n").encode()
+    conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=timeout)
+    try:
+        conn.request("POST", path, body=body, headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+        r = conn.getresponse()
+        return r.status, r.read()
+    except Exception as e:
+        return server._failed(e, timeout, None)
+    finally:
+        conn.close()
+
+
+def _skeleton_sequence(server, results, key, ds):
+    """ls, get, upload, replace, delete, then ls and get again, on ds."""
+    swc = "1 1 5.5 6.5 7.5 1.0 -1\n2 3 5.75 6.75 7.75 1.0 1\n3 3 6.0 7.0 8.0 1.0 2\n"
+    api = f"/{ds}/skeleton_api"
+    results[f"{key}: ls"] = digest(*server.request("GET", f"{api}/ls"))
+    results[f"{key}: get 1"] = digest(*server.request("GET", f"{api}/get/1"))
+    results[f"{key}: upload"] = digest(*_post_multipart(server, f"{api}/upload", swc))
+    results[f"{key}: replace 1"] = digest(*_post_multipart(server, f"{api}/replace/1", swc))
+    results[f"{key}: delete 2 (a GET)"] = digest(*server.request("GET", f"{api}/delete/2"))
+    results[f"{key}: ls after"] = digest(*server.request("GET", f"{api}/ls"))
+    results[f"{key}: get 1 after"] = digest(*server.request("GET", f"{api}/get/1"))
+
+
+def sc_skeleton_api_writes(server, results, sid):
+    """skeleton_api's upload, replace and delete (a GET) change a dataset's
+    traces.sql with no token. The fork refuses them with 403 unless the
+    server runs with SKELETON_API_WRITES=1; ls and get still answer.
+    Production has no such setting and always writes. Three servers: this
+    one (unset), one with SKELETON_API_WRITES=1 on a dataset of its own
+    (every answer as production's), and one with a value that is not 0 or 1
+    (ignored with a log line, so writes stay off). traces.sql rows carry a
+    TIMESTAMP set when written, so its bytes are not compared across
+    servers; each server records whether the file changed instead."""
+    off, on = "sc_skel", "sc_skel_on"
+    for ds in (off, on):
+        _traces_dataset(os.path.join(server.data_dir, ds))
+    traces = os.path.join(server.data_dir, off, "traces.sql")
+    built = file_sha(traces)
+    for ds in (off, on):
+        _wait_visible(server, f"{ds}/traces.sql")
+    _skeleton_sequence(server, results, f"{sid}: unset", off)
+    results[f"{sid}: unset: traces.sql"] = {"status": "unchanged" if file_sha(traces) == built else "changed",
+                                            "len": None, "sha256": None, "text": None}
+    results[f"{sid}: unset: startup line"] = {"status": "line", "len": None, "sha256": None,
+                                              "text": _startup_line(server.logs_tail(10**6), "skeleton_api writes:")}
+    for tag, env, ds in (("1", {"SKELETON_API_WRITES": "1"}, on), ("yes", {"SKELETON_API_WRITES": "yes"}, off)):
+        other = Server(f"{server.role}-skeleton-{tag}", server.image, server.platform, server.data_dir, env)
+        try:
+            other.start()
+            before = file_sha(os.path.join(server.data_dir, ds, "traces.sql"))
+            if tag == "1":
+                _skeleton_sequence(other, results, f"{sid}: SKELETON_API_WRITES={tag}", ds)
+            else:
+                results[f"{sid}: SKELETON_API_WRITES={tag}: delete 1 (a GET)"] = digest(
+                    *other.request("GET", f"/{ds}/skeleton_api/delete/1"))
+            changed = file_sha(os.path.join(server.data_dir, ds, "traces.sql")) != before
+            results[f"{sid}: SKELETON_API_WRITES={tag}: traces.sql"] = {
+                "status": "changed" if changed else "unchanged", "len": None, "sha256": None, "text": None}
+            log = other.logs_tail(400)
+            results[f"{sid}: SKELETON_API_WRITES={tag}: startup line"] = {
+                "status": "line", "len": None, "sha256": None, "text": _startup_line(log, "skeleton_api writes:")}
+            if tag == "yes":
+                results[f"{sid}: SKELETON_API_WRITES={tag}: logged"] = {
+                    "status": "logged" if any("SKELETON_API_WRITES ignored" in line for line in log) else "not logged",
+                    "len": None, "sha256": None, "text": None}
+        finally:
+            other.stop()
+            other.save_logs(os.path.join(os.path.dirname(server.data_dir), f"{other.role}.log"))
+            other.remove()
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
 # s7 runs last: production dies in it, and nothing should depend on a server
@@ -858,6 +976,7 @@ SCENARIOS = [
     ("s11 empty metadata.bin", sc_empty_metadata),
     ("s12 zero mchunk size", sc_zero_mchunk_size),
     ("s17 keep-alive connections", sc_keepalive),
+    ("s18 skeleton_api writes", sc_skeleton_api_writes),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]

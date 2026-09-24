@@ -60,7 +60,13 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
     response is still being sent. Its `100 Continue` shares the completion
     of a whole response, which clears the real answer while it is still
     queued: the first body byte goes out as 0, and a `Connection: close`
-    answer is cut off. The sanitizer build aborts on both.
+    answer is cut off. The sanitizer build aborts on both;
+  - s18: `skeleton_api` upload, replace and delete (a GET) on a dataset
+    with a `traces.sql`, with `ls` and `get` before and after, on this
+    server (writes off by default), on a second server with
+    `SKELETON_API_WRITES=1` and its own dataset, and on one with a value
+    that is not 0 or 1. Rows carry the time they were written, so the
+    file's bytes are not compared; each server records whether it changed.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
@@ -75,7 +81,8 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
   a listed difference that did not occur (the candidate behaves like the
   baseline there again), and a listed difference where an answer is not the
   expected one.
-- Each server's full log is saved to `<work>/<role>.log`.
+- Each server's full log is saved to `<work>/<role>.log`, and s18's other
+  servers' to `<work>/<role>-skeleton-<value>.log`.
 
 Compare like with like: run both images on amd64. An integer division by zero
 that kills the process on x86-64 returns 0 on arm64, so an arm64 candidate can
