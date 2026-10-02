@@ -119,7 +119,8 @@ def reader(port, stop, count, errors):
 def start_server(args, work):
     """Starts the image on work; returns (container name, port)."""
     name = f"cdn-stress-d6-{os.getpid()}"
-    cmd = ["docker", "run", "-d", "--name", name, "-p", "127.0.0.1::6000", "-v", f"{work}:/data"]
+    cmd = ["docker", "run", "-d", "--pull", "never", "--name", name, "-p", "127.0.0.1::6000",
+           "-v", f"{work}:/data"]
     if args.platform:
         cmd += ["--platform", args.platform]
     subprocess.run(cmd + [args.image], check=True, capture_output=True)

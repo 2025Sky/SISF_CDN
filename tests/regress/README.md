@@ -10,6 +10,10 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
                   --allow expected_diffs.json --report /tmp/report.json
 ```
 
+Servers are started with `docker run --pull never` (here and in
+`stress_d6.py`), so both images must already be local: `docker pull` the
+baseline first. A missing image fails the run instead of being fetched.
+
 - `fixtures.py` writes the datasets. Its bytes match pySISF 0.4.1 and the
   portal's tiled writer (checked file by file when it was written).
 - Reads: status code and SHA-256 of every body. Writes: the portal's

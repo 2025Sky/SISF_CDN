@@ -73,7 +73,7 @@ class Server:
         subprocess.run(["docker", "exec", self.name, *args], check=True, capture_output=True)
 
     def start(self):
-        cmd = ["docker", "run", "-d", "--name", self.name, "-p", "127.0.0.1::6000",
+        cmd = ["docker", "run", "-d", "--pull", "never", "--name", self.name, "-p", "127.0.0.1::6000",
                "-v", f"{self.data_dir}:/data"]
         for k, v in self.env.items():
             cmd += ["-e", f"{k}={v}"]
