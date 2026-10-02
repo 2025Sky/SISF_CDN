@@ -960,8 +960,7 @@ int main(int argc, char *argv[])
 			scale = 0;
 		}
 
-		// if (scale == 0)
-		if (scale != 1)
+		if (scale == 0)
 		{
 			res.code = crow::status::BAD_REQUEST;
 			res.end("400 Bad Request -- Invalid scale string\n");
@@ -1006,7 +1005,7 @@ int main(int argc, char *argv[])
 
 		std::string write_error;
 		if (!reader->replace_region(
-			1, x_begin, x_end, y_begin, y_end, z_begin, z_end, insert.c_str(), write_error
+			scale, x_begin, x_end, y_begin, y_end, z_begin, z_end, insert.c_str(), write_error
 		))
 		{
 			res.code = crow::status::INTERNAL_SERVER_ERROR;

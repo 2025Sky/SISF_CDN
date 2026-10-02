@@ -96,7 +96,19 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
     points chunks at each other's bytes. Where the frames land depends on
     which write goes first, so these files are not in the byte comparison.
     `concurrent_patch.py --image IMAGE --work DIR [--runs N]` runs s19 on
-    one image and fails on any problem, without a baseline.
+    one image and fails on any problem, without a baseline;
+  - s20: PATCHes into levels 2 and 4 of a writable layer that has levels 1,
+    2 and 4, every level of every mchunk created empty as the portal would
+    (production and stage 2 refuse every level but 1): a box across
+    mchunks at level 2, one out to level 4's far edges, one inside chunks
+    level 2 already holds, then one at level 1. After each, every level is
+    read whole with the token and must equal what was sent to it with a
+    200, and the level-1 files must be the same bytes on both servers. Then
+    level 0, a level the layer does not have (8), a box past level 2's own
+    size but inside level 1's, and a level-4 box across an mchunk with no 4X
+    files are refused, and every file of both datasets is as it was before
+    them. A build that lets the level through the route check but writes
+    level 1 answers 200 and puts the level-2 voxels into level 1.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a

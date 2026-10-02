@@ -1291,6 +1291,86 @@ def sc_concurrent_patch(server, results, sid, rounds=CPATCH_ROUNDS, problems=Non
         problems += bad_patch + wrong + bad_read + disk
 
 
+def _pyramid_layer(root, holes):
+    """A writable layer with levels 1, 2 and 4, every level of every mchunk an
+    empty skeleton of shape max(1, d // s), as the portal would create one.
+    With holes, mchunk (1,0,0) has no 4X files."""
+    size, mchunk = (160, 150, 70), (96, 96, 48)
+    fixtures.segmentation(root, size, mchunk, RES)
+    spans = [list(fixtures.iterate_bounded(n, m)) for n, m in zip(size, mchunk)]
+    for s in (2, 4):
+        for i, j, k in np.ndindex(*(len(a) for a in spans)):
+            if not (holes and s == 4 and (i, j, k) == (1, 0, 0)):
+                shape = tuple(max(1, (e - b) // s) for b, e in (spans[0][i], spans[1][j], spans[2][k]))
+                name = f"chunk_{i}_{j}_{k}.0.{s}X"
+                fixtures.write_skeleton(f"{root}/data/{name}.data", f"{root}/meta/{name}.meta", shape, (32, 32, 32))
+
+
+def sc_pyramid_writes(server, results, sid):
+    """PATCHes into levels 2 and 4 of a writable layer with levels 1, 2 and 4
+    (production and stage 2 refuse every level but 1): across mchunks at
+    level 2, out to level 4's far edges, inside chunks level 2 already holds,
+    then at level 1. After each, every level is read whole with the token and
+    compared with what was sent to it with a 200, so a write that lands in
+    another level, or changes one it was not sent to, shows; the level-1
+    files must be the same bytes on both servers. Then refusals that must
+    leave every file as it was: level 0, a level the layer does not have (8),
+    a box past level 2's own size but inside level 1's, and a level-4 box
+    across an mchunk that has no 4X files."""
+    ds, holes = "sc_pyr", "sc_pyr_holes"
+    for name in (ds, holes):
+        root = os.path.join(server.data_dir, name)
+        _pyramid_layer(root, name == holes)
+        for dirpath, _, files in os.walk(root):  # every level is there before the server first scans it
+            for f in files:
+                _wait_visible(server, os.path.relpath(os.path.join(dirpath, f), server.data_dir))
+    tok = f"+token={fixtures.TOKEN}"
+    st, body = server.request("GET", f"/{ds}/info")
+    results[f"{sid}: /info"] = digest(st, body)
+    scales = json.loads(body)["scales"] if st == 200 else []
+    model = {int(s["key"]): np.zeros(s["size"][::-1], np.uint16) for s in scales}  # [z, y, x] as reads return
+    steps = [("level 2", 2, (32, 64, 16, 64, 8, 32)), ("level 4", 4, (8, 40, 0, 37, 4, 17)),
+             ("level 2 inside stored chunks", 2, (40, 56, 36, 52, 20, 28)), ("level 1", 1, (0, 128, 0, 128, 0, 64))]
+    for n, (tag, lvl, (x0, x1, y0, y1, z0, z1)) in enumerate(steps):
+        vol = np.random.default_rng([20, n]).integers(1, 65536, size=(z1 - z0, y1 - y0, x1 - x0), dtype=np.uint16)
+        st, body = server.request("PATCH", f"/{ds}{tok}/write/{lvl}/" + box(x0, x1, y0, y1, z0, z1), vol.tobytes())
+        results[f"{sid}: PATCH {tag}"] = digest(st, body)
+        if st == 200 and lvl in model:
+            model[lvl][z0:z1, y0:y1, x0:x1] = vol
+        parts, ok = [], True
+        for lv, want in sorted(model.items()):
+            Z, Y, X = want.shape
+            st, got = server.request("GET", f"/{ds}{tok}/{lv}/" + box(0, X, 0, Y, 0, Z))
+            if st != 200 or len(got) != want.nbytes:
+                ok = False
+                parts.append(f"{lv}X read {st}, {len(got)} bytes")
+                continue
+            bad = np.count_nonzero(np.frombuffer(got, np.uint16).reshape(want.shape) != want)
+            ok &= bad == 0
+            parts.append(f"{lv}X {bad} of {want.size} voxels differ, {np.count_nonzero(want)} sent")
+        results[f"{sid}: every level after PATCH {tag}"] = {"status": "match" if ok else "mismatch", "len": None,
+                                                           "sha256": None, "text": "; ".join(parts)}
+    find = f"cd /data && find {ds} {holes} -type f -exec sha256sum {{}} + | sort -k 2"
+    files = lambda: subprocess.run(["docker", "exec", server.name, "sh", "-c", find],
+                                   capture_output=True, text=True).stdout.splitlines()
+    before = files()
+    level1 = [x for x in before if f" {ds}/" in x and ".1X." in x]
+    results[f"{sid}: level-1 files after the writes"] = {
+        "status": "files", "len": len(level1), "sha256": hashlib.sha256("\n".join(level1).encode()).hexdigest(),
+        "text": None}
+    body = np.full(16 ** 3, 3, dtype=np.uint16).tobytes()
+    b16 = box(0, 16, 0, 16, 0, 16)
+    for tag, path in (("level 0", f"/{ds}{tok}/write/0/{b16}"),
+                      ("level 8, which the layer does not have", f"/{ds}{tok}/write/8/{b16}"),
+                      ("level 2 past its own size", f"/{ds}{tok}/write/2/" + box(72, 88, 0, 16, 0, 16)),
+                      ("level 4 across an mchunk without 4X files", f"/{holes}{tok}/write/4/" + box(16, 32, 0, 16, 0, 16))):
+        results[f"{sid}: PATCH {tag}"] = digest(*server.request("PATCH", path, body))
+    changed = sorted(set(before) ^ set(files()))
+    results[f"{sid}: files after the refusals"] = {"status": "same" if not changed else "changed", "len": None,
+                                                   "sha256": None, "text": f"{len(before)} files before"
+                                                   + "".join(f"; {x}" for x in changed[:6])}
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
 # s7 runs last: production dies in it, and nothing should depend on a server
@@ -1312,11 +1392,14 @@ SCENARIOS = [
     ("s14 read limit", sc_read_limit),
     ("s15 files replaced during a read", sc_replaced_during_read),
     ("s19 concurrent PATCHes into one mchunk", sc_concurrent_patch),
+    ("s20 writes to coarser levels", sc_pyramid_writes),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
 # sc_cpatch (s19) is not here: where its frames land in the .data depends on
 # which of its concurrent writes goes first, so s19 checks those files itself.
+# Nor are s20's: their coarse files differ wherever a server refuses coarse
+# writes, so s20 compares its level-1 files and checks the rest itself.
 SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short", "sc_strict", "sc_regrow", "sc_regrow_w",
                      "sc_cold", "sc_video", "sc_ka_image", "sc_ka_labels", "sc_rename"]
 
