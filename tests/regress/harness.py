@@ -793,16 +793,28 @@ def _first_values(pairs):
     return out
 
 
-def _keepalive_case(server, results, key, reqs):
+def _keepalive_case(server, results, key, reqs, connection_apart=False):
     """Sends reqs, (tag, path, accept_encoding[, extra headers]) each, on one
     connection and records each answer as _encoded_read does under
     key + ": " + tag, its headers record adding the number of Connection
-    headers and whether the request went out on a new connection."""
+    headers and whether the request went out on a new connection. With
+    connection_apart those two are left out of the headers records and
+    key + ": connection" holds them instead: "ok" when every request was
+    answered with exactly one Connection header on the connection the first
+    one opened, else "problems" and the answers that were not."""
     answers = server.get_keepalive([r[1:] for r in reqs])
+    off = []
     for (tag, *_), (st, pairs, raw, reused) in zip(reqs, answers):
         n = sum(1 for k, _ in pairs if k == "connection")
         note = f"; Connection headers: {n}" + ("" if reused else "; on a new connection")
-        _record_encoded(results, f"{key}: {tag}", st, _first_values(pairs), raw, note)
+        if n != 1 or not reused:
+            off.append(f"{tag}: Connection headers {n}" + ("" if reused else ", on a new connection"))
+        _record_encoded(results, f"{key}: {tag}", st, _first_values(pairs), raw, "" if connection_apart else note)
+    if connection_apart:
+        ok = not off and len(answers) == len(reqs)
+        results[f"{key}: connection"] = {
+            "status": "ok" if ok else "problems", "len": None, "sha256": None,
+            "text": f"{len(answers)} of {len(reqs)} requests answered" + "".join(f"; {x}" for x in off)}
     for tag, *_ in reqs[len(answers):]:
         results[f"{key}: {tag}"] = {"status": "not sent", "len": None, "sha256": None,
                                     "text": "an earlier request on the connection failed"}
@@ -908,8 +920,10 @@ def sc_keepalive(server, results, sid):
     body byte went out as 0) and, for a close, the connection while the real
     answer's buffers were still queued. Each answer is recorded as
     _encoded_read does, its headers record adding the number of Connection
-    headers. Then a short stress (see _keepalive_stress): bodies over 1 MiB
-    and small ones, each followed on the same connection by another."""
+    headers (in the Expect case one record of its own holds those for every
+    answer, see below). Then a short stress (see _keepalive_stress): bodies
+    over 1 MiB and small ones, each followed on the same connection by
+    another."""
     img, lab = "sc_ka_image", "sc_ka_labels"
     fixtures.untiled(os.path.join(server.data_dir, img), fixtures.pattern((1, 128, 128, 64), 17), (64, 64, 32),
                      RES, 1)
@@ -929,6 +943,13 @@ def sc_keepalive(server, results, sid):
     _keepalive_case(server, results, f"{sid}: a mesh file, then an image over 1 MiB",
                     [("1 mesh file", mesh, httpx), ("2 image", big_img, httpx)])
     expect = (("Expect", "100-continue"),)
+    # Connection apart: production's answers here race its 100 Continue
+    # completion, so how many Connection headers it sends and whether it
+    # keeps the connection open change from run to run (the mesh file with 2
+    # or 0, and in some runs every later request on a new connection), while
+    # status and decoded body do not. Compared with the baseline, those runs
+    # failed a fork that had answered correctly. The fork is held to one
+    # header each on one connection by that record's entry in the allow file.
     _keepalive_case(server, results, f"{sid}: Expect: 100-continue among large and small reads",
                     [("1 image", big_img, httpx),
                      ("2 mesh file, Expect", mesh, httpx, expect),
@@ -937,7 +958,7 @@ def sc_keepalive(server, results, sid):
                      ("5 portal read", portal, httpx),
                      ("6 32^3 chunk, Expect", chunk, "gzip", expect),
                      ("7 portal read, Expect, Connection: close", portal, httpx,
-                      expect + (("Connection", "close"),))])
+                      expect + (("Connection", "close"),))], connection_apart=True)
     plan = [(big_img, httpx), (portal, httpx), (big_lab, None), (mesh, httpx), (chunk, "gzip"), (big_lab, httpx),
             (f"/{img}/1/" + box(0, 128, 0, 128, 10, 11), None)]
     _keepalive_stress(server, results, f"{sid}: stress", plan)

@@ -60,7 +60,11 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
     response is still being sent. Its `100 Continue` shares the completion
     of a whole response, which clears the real answer while it is still
     queued: the first body byte goes out as 0, and a `Connection: close`
-    answer is cut off. The sanitizer build aborts on both;
+    answer is cut off. The sanitizer build aborts on both. Production's
+    `Connection` headers and connection reuse in the `Expect` case change
+    from run to run, so there they are kept in one record of their own,
+    which the allow file pins for the fork only (one header each, one
+    connection), and the baseline is compared by status and body;
   - s18: `skeleton_api` upload, replace and delete (a GET) on a dataset
     with a `traces.sql`, with `ls` and `get` before and after, on this
     server (writes off by default), on a second server with
