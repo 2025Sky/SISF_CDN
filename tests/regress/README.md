@@ -118,6 +118,17 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
 environment variable, e.g. `CHUNK_CACHE_LINES=4096` to check that a larger
 chunk cache changes no answer.
 
+`health.py --image IMAGE --work DIR [--lock-ms 700] [--runs N] [--require-hook]`
+checks `/health` on one image, without a baseline: 200 `ok lock_wait_ms=N`
+at idle (also with `READ_ONLY=1`), leaving `/performance` and every file as
+they were; `HEALTH_LOCK_MS` taken, or ignored with one log line; and, while
+a write is held inside the chunk cache lock, 503 `stuck lock_wait_ms=N
+write_held_ms=M` within `HEALTH_LOCK_MS` + 0.5 s with no request thread left
+waiting, then 200 again once the write goes through. Holding the write
+needs a build made with `-DNTRACER_TEST_HOOKS=ON` (a write then waits while
+`/data/.test_hold_write_lock` exists); on any other build that part is
+reported as SKIPPED, and `--require-hook` makes that a failure.
+
 `stress_d6.py` is not part of the gate. It stresses stale chunks in the
 chunk cache, which sit between two points inside the server and cannot be
 triggered on demand from outside. `--mode patch`: a read that decoded a

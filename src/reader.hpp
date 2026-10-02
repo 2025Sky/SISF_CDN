@@ -161,6 +161,49 @@ struct global_chunk_key_hash
 };
 
 std::timed_mutex global_chunk_cache_mutex;
+
+// When the write holding global_chunk_cache_mutex took it (steady clock, in
+// ns), or 0 while no write holds it. /health reports how long that is. Other
+// holders (a header reload, the cache) leave it at 0.
+std::atomic<int64_t> chunk_write_lock_since_ns{0};
+
+int64_t steady_now_ns()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Records when a write took global_chunk_cache_mutex. Declared after the
+// lock_guard, so it is destroyed first: the time is cleared before the lock
+// is released.
+struct chunk_write_lock_timer
+{
+    chunk_write_lock_timer() { chunk_write_lock_since_ns.store(steady_now_ns()); }
+    ~chunk_write_lock_timer() { chunk_write_lock_since_ns.store(0); }
+};
+
+#ifdef NTRACER_TEST_HOOKS
+extern std::string DATA_PATH;
+
+// Test-only (CMake option NTRACER_TEST_HOOKS, off by default): while the file
+// <data path>/.test_hold_write_lock exists, a write waits here holding
+// global_chunk_cache_mutex, as one stuck in a storage call would.
+// tests/regress/health.py uses it to check /health.
+void test_hold_write_lock()
+{
+    const std::string marker = DATA_PATH + ".test_hold_write_lock";
+    if (access(marker.c_str(), F_OK) != 0)
+    {
+        return;
+    }
+    std::cerr << "TEST HOOK: write holding the chunk cache lock while " << marker << " exists" << std::endl;
+    while (access(marker.c_str(), F_OK) == 0)
+    {
+        usleep(50 * 1000);
+    }
+    std::cerr << "TEST HOOK: write lock released" << std::endl;
+}
+#endif
+
 size_t global_cache_size = chunk_cache_lines_from_env();
 global_chunk_line *global_chunk_cache = (global_chunk_line *)calloc(global_cache_size, sizeof(global_chunk_line));
 size_t global_chunk_cache_last = 0;
@@ -1269,6 +1312,10 @@ public:
         {
             // Released on every return and if anything below throws
             std::lock_guard<std::timed_mutex> lock(global_chunk_cache_mutex);
+            chunk_write_lock_timer lock_timer;
+#ifdef NTRACER_TEST_HOOKS
+            test_hold_write_lock();
+#endif
 
             fd_closer data_file, meta_file;
             data_file.fd = open(data_fname.c_str(), O_RDWR | O_CLOEXEC);

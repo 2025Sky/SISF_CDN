@@ -50,6 +50,12 @@ bool READ_ONLY_MODE = false;
 // client chooses checks it (the image route, tracing, raw_access). 0 (the
 // default) is no limit.
 size_t MAX_READ_VOXELS = 0;
+// HEALTH_LOCK_MS: how long /health waits for the chunk cache lock before it
+// answers 503, from 1 to 30000 ms (default 2000). 0 would turn the wait into
+// a single attempt, which a write holding the lock for a moment would fail;
+// 30 s is Docker's default health check timeout, and a longer wait would hold
+// a request thread after any caller has given up.
+size_t HEALTH_LOCK_MS = 2000;
 
 // Whether a read of an x by y by z box is within MAX_READ_VOXELS; always
 // true when no limit is set
@@ -330,6 +336,21 @@ int main(int argc, char *argv[])
 		std::cerr << "MAX_READ_VOXELS ignored (not a whole number): " << max_read_voxels << std::endl;
 	}
 
+	std::string health_lock_ms = read_env_variable("HEALTH_LOCK_MS");
+	if (health_lock_ms.size() > 0)
+	{
+		size_t n = 0;
+		if (parse_decimal(health_lock_ms, n) && n >= 1 && n <= 30000)
+		{
+			HEALTH_LOCK_MS = n;
+		}
+		else
+		{
+			std::cerr << "HEALTH_LOCK_MS ignored (not a whole number from 1 to 30000): " << health_lock_ms
+					  << "; using " << HEALTH_LOCK_MS << std::endl;
+		}
+	}
+
 	std::string thread_count = read_env_variable("THREAD_COUNT");
 	if (thread_count.size() > 0)
 	{
@@ -354,6 +375,31 @@ int main(int argc, char *argv[])
 	CROW_ROUTE(app, "/version")
 	([]()
 	 { return VERSION_STRING; });
+
+	// Whether a write is stuck holding the chunk cache lock. Every write, and
+	// the first read after a .meta changes, waits for that lock, while / and
+	// /version still answer. 200 "ok" when the lock can be taken within
+	// HEALTH_LOCK_MS (it is released at once), else 503 "stuck" with how long
+	// the write holding it has held it (-1 if the holder is not a write).
+	// Reads no file, takes no other lock and needs no token.
+	CROW_ROUTE(app, "/health")
+	([]()
+	 {
+		const auto start = std::chrono::steady_clock::now();
+		std::unique_lock<std::timed_mutex> lock(global_chunk_cache_mutex, std::defer_lock);
+		const bool got = lock.try_lock_for(std::chrono::milliseconds(HEALTH_LOCK_MS));
+		if (got)
+		{
+			lock.unlock();
+		}
+		const std::string wait = "lock_wait_ms=" + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+		if (got)
+		{
+			return crow::response(200, "text/plain", "ok " + wait + "\n");
+		}
+		const int64_t since = chunk_write_lock_since_ns.load();
+		const int64_t held_ms = since == 0 ? -1 : (steady_now_ns() - since) / 1000000;
+		return crow::response(503, "text/plain", "stuck " + wait + " write_held_ms=" + std::to_string(held_ms) + "\n"); });
 
 	CROW_ROUTE(app, "/debug_headers")
 	(
