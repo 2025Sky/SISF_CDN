@@ -74,6 +74,20 @@ jobs:
           python harness.py --baseline "$BASELINE" --candidate sisf_cdn:candidate \
             --work "$RUNNER_TEMP/regress" --allow expected_diffs.json --report "$RUNNER_TEMP/report.json"
 
+      # The harness sends its PATCHes one at a time, so it passes a write that
+      # lets a read racing it put the old chunk back into the chunk cache (a
+      # PATCH that does not bump the mchunk's data_gen). This PATCHes one chunk
+      # 300 times while 8 processes read it and fails if a read after a PATCH
+      # returns older contents. It runs even when the harness failed, so both
+      # results show; a failure here still keeps the image from being published.
+      - name: D6 stress (PATCHes under concurrent reads)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        working-directory: tests/regress
+        run: |
+          python stress_d6.py --image sisf_cdn:candidate --work "$RUNNER_TEMP/stress_d6" \
+            --mode patch --writes 300 --readers 8
+
       # ASan aborts on its first error, which the harness already fails as a
       # candidate crash; this step names the report. UBSan messages do not stop
       # the server and are listed only (known: crow.h bool loads, the point-cloud

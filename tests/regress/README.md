@@ -145,7 +145,8 @@ needs a build made with `-DNTRACER_TEST_HOOKS=ON` (a write then waits while
 `/data/.test_hold_write_lock` exists); on any other build that part is
 reported as SKIPPED, and `--require-hook` makes that a failure.
 
-`stress_d6.py` is not part of the gate. It stresses stale chunks in the
+`stress_d6.py` is not part of the harness; CI runs `--mode patch` once (300
+PATCHes) on the candidate after it. It stresses stale chunks in the
 chunk cache, which sit between two points inside the server and cannot be
 triggered on demand from outside. `--mode patch`: a read that decoded a
 chunk while a PATCH replaced it putting the old chunk back into the cache;
