@@ -40,6 +40,7 @@ import urllib.error
 import urllib.request
 
 import numpy as np
+import zstd
 
 import fixtures
 
@@ -1124,6 +1125,172 @@ def sc_replaced_during_read(server, results, sid):
         "len": None, "sha256": None, "text": None}
 
 
+CPATCH_CHUNK = 32
+CPATCH_GRID = (4, 4, 2)  # chunks in x, y and z: one mchunk of 128x128x64
+CPATCH_ROUNDS = 40
+
+
+def _cpatch_id(cx, cy, cz):
+    """The chunk's index in the mchunk's table (x slowest, z fastest)."""
+    _, ny, nz = CPATCH_GRID
+    return (cx * ny + cy) * nz + cz
+
+
+def _cpatch_xyz(i):
+    _, ny, nz = CPATCH_GRID
+    cx, rest = divmod(i, ny * nz)
+    return cx, *divmod(rest, nz)
+
+
+def _cpatch_contents(rnd, cx, cy, cz):
+    """Chunk (cx, cy, cz)'s voxels in round rnd, indexed [z, y, x] as a read
+    returns them: noise that zstd cannot compress, so every frame has the
+    same length and a frame written over another's bytes still decodes, with
+    voxel 0 naming the round and the chunk."""
+    n = CPATCH_GRID[0] * CPATCH_GRID[1] * CPATCH_GRID[2]
+    a = np.random.default_rng([19, rnd, cx, cy, cz]).integers(0, 65536, size=(CPATCH_CHUNK,) * 3, dtype=np.uint16)
+    a[0, 0, 0] = 1 + rnd * n + _cpatch_id(cx, cy, cz)
+    return a
+
+
+def _cpatch_holds(got, rnd):
+    """What a chunk read back in round rnd holds instead of its own voxels."""
+    if got.size != CPATCH_CHUNK ** 3:
+        return f"{got.size} voxels"
+    n = CPATCH_GRID[0] * CPATCH_GRID[1] * CPATCH_GRID[2]
+    r, i = divmod(int(got[0]) - 1, n)
+    if 0 <= r <= rnd and np.array_equal(got, _cpatch_contents(r, *_cpatch_xyz(i)).reshape(-1)):
+        return f"chunk {_cpatch_xyz(i)} of round {r}"
+    return "zeros" if not got.any() else "voxels no PATCH wrote"
+
+
+def _concurrent_patches(server, reqs, timeout=SCENARIO_TIMEOUT):
+    """Sends each (path, body) of reqs as a PATCH on its own connection, all
+    released at once when every connection is open. Returns each one's
+    status, or the name of the exception it ended with."""
+    out = [None] * len(reqs)
+    gate = threading.Barrier(len(reqs))
+
+    def send(i):
+        path, body = reqs[i]
+        conn = http.client.HTTPConnection("127.0.0.1", server.port, timeout=timeout)
+        try:
+            conn.connect()
+            gate.wait(timeout)
+            conn.request("PATCH", path, body)
+            r = conn.getresponse()
+            r.read()
+            out[i] = r.status
+        except Exception as e:
+            gate.abort()
+            out[i] = type(e).__name__
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=send, args=(i,)) for i in range(len(reqs))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return out
+
+
+def sc_concurrent_patch(server, results, sid, rounds=CPATCH_ROUNDS, problems=None):
+    """PATCHes sent at once into one mchunk of a writable layer. All chunks
+    of an mchunk are appended to its one .data, and each PATCH records where
+    its chunk went in the mchunk's one .meta; a server that lets two writes
+    do that at the same time can point a chunk at another chunk's bytes and
+    still answer 200. The mchunk holds 4x4x2 chunks of 32^3. Each round, 8
+    clients send at once one PATCH each covering a column of 4 whole chunks
+    in y that only that client writes, with contents new to the round; then
+    every chunk is read back with the token and must hold what its client
+    sent. After the last round, every .meta entry must lie inside the .data,
+    share no byte with another entry, and decode (zstd) to the chunk sent
+    last, and the whole mchunk is read once more. Where the frames land in
+    the .data depends on which write goes first, so the files' bytes are not
+    compared across servers (the dataset is not in SCENARIO_DATASETS).
+    problems, when given, receives every problem found, one line each."""
+    ds = "sc_cpatch"
+    c = CPATCH_CHUNK
+    nx, ny, nz = CPATCH_GRID
+    X, Y, Z = nx * c, ny * c, nz * c
+    root = os.path.join(server.data_dir, ds)
+    fixtures.segmentation(root, (X, Y, Z), (X, Y, Z), RES)  # one mchunk, nothing written yet
+    for rel in ("metadata.bin", ".sisf_access", "meta/chunk_0_0_0.0.1X.meta", "data/chunk_0_0_0.0.1X.data"):
+        _wait_visible(server, f"{ds}/{rel}")
+    write, read = f"/{ds}+token={fixtures.TOKEN}/write/1/", f"/{ds}+token={fixtures.TOKEN}/1/"
+    results[f"{sid}: first read"] = digest(*server.request("GET", read + box(0, X, 0, Y, 0, Z)))
+
+    clients = [(cx, cz) for cz in range(nz) for cx in range(nx)]
+    chunks = [(cx, cy, cz) for cx in range(nx) for cy in range(ny) for cz in range(nz)]
+    bad_patch, bad_read, wrong = [], [], []
+    last = {}
+    for rnd in range(rounds):
+        reqs = []
+        for cx, cz in clients:
+            column = [_cpatch_contents(rnd, cx, cy, cz) for cy in range(ny)]
+            last.update({(cx, cy, cz): a for cy, a in enumerate(column)})
+            reqs.append((write + box(cx * c, cx * c + c, 0, Y, cz * c, cz * c + c),
+                         np.concatenate(column, axis=1).tobytes()))
+        statuses = _concurrent_patches(server, reqs)
+        bad_patch += [f"round {rnd} column {cl}: {st}" for cl, st in zip(clients, statuses) if st != 200]
+        alive, code = server.running()
+        if not alive:
+            bad_patch.append(f"round {rnd}: server died (exit {code})")
+            server.restart()
+            break
+        for cx, cy, cz in chunks:
+            st, body = server.request("GET", read + box(cx * c, cx * c + c, cy * c, cy * c + c, cz * c, cz * c + c))
+            if st != 200:
+                bad_read.append(f"round {rnd} chunk {(cx, cy, cz)}: {st}")
+                continue
+            got = np.frombuffer(body, dtype=np.uint16)
+            if not np.array_equal(got, last[(cx, cy, cz)].reshape(-1)):
+                wrong.append(f"round {rnd} chunk {(cx, cy, cz)}: holds {_cpatch_holds(got, rnd)}")
+
+    # The files as the server's container sees them
+    cat = lambda ext: subprocess.run(["docker", "exec", server.name, "cat", f"/data/{ds}/{ext}/chunk_0_0_0.0.1X.{ext}"],
+                                     check=True, capture_output=True).stdout
+    meta, data = cat("meta"), cat("data")
+    header = struct.calcsize(fixtures.SHARD_HEADER_LAYOUT)
+    line = struct.calcsize(fixtures.SHARD_LINE_LAYOUT)
+    disk, spans = [], []
+    for xyz in chunks:
+        i = _cpatch_id(*xyz)
+        off, n = struct.unpack(fixtures.SHARD_LINE_LAYOUT, meta[header + line * i:header + line * (i + 1)])
+        if n == 0 or off + n > len(data):
+            disk.append(f"chunk {xyz}: entry {off}+{n} is not inside the .data ({len(data)} bytes)")
+            continue
+        spans.append((off, off + n, xyz))
+        try:
+            stored = zstd.ZSTD_uncompress(data[off:off + n])
+        except Exception as e:
+            disk.append(f"chunk {xyz}: entry {off}+{n} does not decode: {e}")
+            continue
+        if xyz in last and stored != last[xyz].transpose(2, 1, 0).tobytes():  # stored x slowest, z fastest
+            disk.append(f"chunk {xyz}: entry {off}+{n} decodes to other voxels than the chunk sent last")
+    spans.sort()
+    for (a0, a1, xa), (b0, b1, xb) in zip(spans, spans[1:]):
+        if b0 < a1:
+            disk.append(f"chunks {xa} and {xb} share bytes {b0}-{min(a1, b1)}")
+
+    def summary(lines):
+        return "".join(f"; {x}" for x in lines[:5]) + (f"; and {len(lines) - 5} more" if len(lines) > 5 else "")
+
+    results[f"{sid}: PATCH answers"] = {
+        "status": "all 200" if not bad_patch else "not all 200", "len": None, "sha256": None,
+        "text": f"{rounds} rounds of {len(clients)} PATCHes at once, {len(bad_patch)} problems" + summary(bad_patch)}
+    results[f"{sid}: chunks read back"] = {
+        "status": "match" if not wrong and not bad_read else "mismatch", "len": None, "sha256": None,
+        "text": f"{len(wrong)} chunks with other contents, {len(bad_read)} reads not 200" + summary(wrong + bad_read)}
+    results[f"{sid}: files on disk"] = {
+        "status": "consistent" if not disk else "inconsistent", "len": None, "sha256": None,
+        "text": f"{len(chunks)} .meta entries, {len(disk)} problems" + summary(disk)}
+    results[f"{sid}: whole mchunk after the last round"] = digest(*server.request("GET", read + box(0, X, 0, Y, 0, Z)))
+    if problems is not None:
+        problems += bad_patch + wrong + bad_read + disk
+
+
 # Cases where production dies, hangs or loses data. Each builds its own dataset
 # while the server runs (the first request for it triggers the inventory re-scan).
 # s7 runs last: production dies in it, and nothing should depend on a server
@@ -1144,9 +1311,12 @@ SCENARIOS = [
     ("s13 channel filter", sc_channel_filter),
     ("s14 read limit", sc_read_limit),
     ("s15 files replaced during a read", sc_replaced_during_read),
+    ("s19 concurrent PATCHes into one mchunk", sc_concurrent_patch),
     ("s8 raw_access outside the mchunk", sc_raw_access_outside),
     ("s7 tile regrown in place", sc_regrown_tile),
 ]
+# sc_cpatch (s19) is not here: where its frames land in the .data depends on
+# which of its concurrent writes goes first, so s19 checks those files itself.
 SCENARIO_DATASETS = ["sc_stale", "sc_zstd", "sc_comp", "sc_nodata", "sc_short", "sc_strict", "sc_regrow", "sc_regrow_w",
                      "sc_cold", "sc_video", "sc_ka_image", "sc_ka_labels", "sc_rename"]
 

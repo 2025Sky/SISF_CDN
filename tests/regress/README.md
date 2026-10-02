@@ -84,7 +84,19 @@ python harness.py --baseline tuffr5/sisf_cdn@sha256:83d43adc... --baseline-platf
     that keeps its files open must not put the old files' chunks into the
     cache). Every answer compared is the same wherever the rename lands;
     whether it catches a broken build depends on it landing while the long
-    read is still reading (see `stress_d6.py --mode rename`).
+    read is still reading (see `stress_d6.py --mode rename`);
+  - s19: PATCHes sent at once into one writable mchunk (4x4x2 chunks of
+    32^3, all appended to the same `.data` and entered in the same
+    `.meta`): each of 40 rounds, 8 clients each PATCH a column of 4 whole
+    chunks that only they write, with new contents that zstd cannot
+    compress, then every chunk is read back with the token. After the last
+    round every `.meta` entry must lie inside the `.data`, share no byte
+    with another entry and decode to the chunk sent last. A build that
+    appends two chunks at once without the chunk lock answers 200 and
+    points chunks at each other's bytes. Where the frames land depends on
+    which write goes first, so these files are not in the byte comparison.
+    `concurrent_patch.py --image IMAGE --work DIR [--runs N]` runs s19 on
+    one image and fails on any problem, without a baseline.
 - `expected_diffs.json` lists the differences that are intended, each with a
   reason and, under `expect`, the candidate's answer: any of `status`,
   `len`, `sha256`, `text` (or `text_prefix`, the start of the text) for a
